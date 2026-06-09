@@ -1,0 +1,29 @@
+[
+  {
+    "id": "1",
+    "title": "Prepare daily meeting notes",
+    "description": "Chuẩn bị note cho daily sync với team.",
+    "status": "todo",
+    "priority": "high",
+    "due_date": "2026-06-05",
+    "last_update": "unknown"
+  },
+  {
+    "id": "2",
+    "title": "Send weekly report",
+    "description": "Gửi báo cáo tuần cho manager.",
+    "status": "todo",
+    "priority": "high",
+    "due_date": "2026-06-05",
+    "last_update": "unknown"
+  },
+  {
+    "id": "3",
+    "title": "Archive completed documents",
+    "description": "Đưa tài liệu đã hoàn thành vào folder archive.",
+    "status": "done",
+    "priority": "low",
+    "due_date": "2026-06-05",
+    "last_update": "unknown"
+  }
+]

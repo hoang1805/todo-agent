@@ -1,0 +1,29 @@
+[
+  {
+    "id": "AI-101",
+    "title": "Fix JSON normalizer bug",
+    "description": "AI normalizer đôi khi trả về markdown thay vì JSON array.",
+    "status": "in_progress",
+    "priority": "critical",
+    "due_date": "2026-06-05",
+    "last_update": "unknown"
+  },
+  {
+    "id": "AI-102",
+    "title": "Add cache for normalized tasks",
+    "description": "Lưu normalized tasks ra file để không phải gọi LLM nhiều lần.",
+    "status": "todo",
+    "priority": "high",
+    "due_date": "2026-06-05",
+    "last_update": "unknown"
+  },
+  {
+    "id": "AI-103",
+    "title": "Write README setup guide",
+    "description": "Viết hướng dẫn cài Ollama, Streamlit và LangChain.",
+    "status": "todo",
+    "priority": "medium",
+    "due_date": "2026-06-07",
+    "last_update": "unknown"
+  }
+]

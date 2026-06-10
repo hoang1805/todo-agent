@@ -1,11 +1,9 @@
-from tools.task_tools import get_task_detail
 from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import HumanMessage, AIMessageChunk
-from tools.task_tools import get_today_task
 from langchain.agents import create_agent
 from typing import List
 from langchain_core.tools import BaseTool
-from llm.ollama_client import create_ollama_model
+from core.llm_client import create_ollama_model
 from langchain.agents.middleware import SummarizationMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -34,10 +32,8 @@ If a task is overdue, politely bring it to their attention.""",
 import streamlit as st
 
 @st.cache_resource
-def get_or_create_agent(model: str, temperature: float):
+async def get_or_create_agent(model: str, temperature: float):
     tools = [
-        get_today_task,
-        get_task_detail
     ]
     return create_ollama_agent(model, temperature, tools)
 

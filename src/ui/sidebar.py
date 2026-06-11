@@ -33,10 +33,9 @@ def render_sidebar():
         if "messages" in st.session_state:
             st.session_state.messages = []
         if "thread_id" in st.session_state:
-            from agents.ollama_agent import clear_agent_thread
-            clear_agent_thread(model_name, temperature, st.session_state.thread_id)
             del st.session_state.thread_id
         st.sidebar.success("✨ Memory cleared successfully!")
+
 
     return {
         "model": model_name,

@@ -3,4 +3,10 @@ langchain
 langchain-core
 langchain-ollama
 langchain-mcp-adapters
+langgraph
+pydantic
 python-dotenv
+nest-asyncio
+
+# dev / testing
+pytest

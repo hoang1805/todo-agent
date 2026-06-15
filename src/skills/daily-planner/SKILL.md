@@ -16,9 +16,19 @@ This skill helps the agent compose an intelligent daily plan based on the user's
 
 ---
 
-## MCP Tools Available
+## Tools You Can Call
 
-Connect to the task MCP server (HTTP) and use these tools:
+These tools are already bound to you — call them directly by name (no setup or
+connection step needed).
+
+**Date helpers (always available):**
+
+| Tool | Purpose |
+|---|---|
+| `get_today_date` | Today's date as `YYYY-MM-DD` — call this to know what "today" is |
+| `get_current_weekday` | The weekday name, e.g. `"Monday"` |
+
+**Task tools (from the task MCP server):**
 
 | Tool | Purpose |
 |---|---|
@@ -28,12 +38,17 @@ Connect to the task MCP server (HTTP) and use these tools:
 | `update_task_status` | Change status: `"pending"`, `"in_progress"`, `"done"` |
 | `create_task` | Add a new task to today's plan if user requests |
 
+> If the task tools are unavailable (none appear when you try to call one), tell
+> the user the task service isn't reachable right now — do **not** invent tasks.
+
 ---
 
 ## Workflow
 
-### Step 1 — Fetch Today's Tasks
-Call `get_today_task` to retrieve all tasks due today.
+### Step 1 — Establish Today, Then Fetch
+First call `get_today_date` (and `get_current_weekday` if you'll greet the user)
+so you can show a real date and resolve any relative dates. Then call
+`get_today_task` to retrieve all tasks due today.
 
 - If the result is **empty**: inform the user they have no tasks due today, then offer to create one or check upcoming tasks.
 - If the result is **non-empty**: proceed to Step 2.
@@ -85,10 +100,11 @@ After presenting the plan, offer options:
 ## Behavioral Rules
 
 - **Never skip the fetch step** — always call `get_today_task` before responding about today's tasks. Do not rely on prior context.
+- **Never guess the date** — get it from `get_today_date`; never hardcode or assume it.
 - **Always respect existing status** — if a task is already `done`, do not suggest working on it unless the user asks.
 - **Be concise in the plan view** — use task name + status only; only show description if the user asks for details or calls `get_task_detail`.
 - **Suggest reprioritization only if it makes sense** — e.g., if many high-priority items are already done, suggest the user may want to promote a medium-priority task.
-- **Date format**: Use a human-friendly format like "Tuesday, June 10" — not raw ISO strings.
+- **Date format**: Convert the ISO date from `get_today_date` into a human-friendly form like "Tuesday, June 10" — don't show raw ISO strings to the user.
 
 ---
 
@@ -100,7 +116,7 @@ After presenting the plan, offer options:
 | All tasks are `done` | Congratulate the user, offer to review tomorrow |
 | Many tasks (>10) | Highlight top 3 high-priority ones first, summarize the rest |
 | Task has no description | Skip description field, show name + status only |
-| User asks to add a task for today | Call `create_task` with `due_date` set to today's date |
+| User asks to add a task for today | Get today's date via `get_today_date`, then call `create_task` with that `due_date` |
 
 ---
 

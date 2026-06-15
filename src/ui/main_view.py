@@ -8,6 +8,8 @@ from langchain_core.tools import BaseTool
 
 from agents.ollama_agent import AgentChunk, run_agent_with_skills, run_task_agent
 
+PLANNER_MODE = "Planner (Multi-Agent)"
+
 if TYPE_CHECKING:
     from core.models import Skill
 
@@ -79,7 +81,10 @@ def render_main_view(
 
         with st.chat_message("ai"):
             with st.spinner("Agent is thinking…", show_time=True):
-                if mode == "Streaming":
+                if mode == PLANNER_MODE:
+                    response = _run_planner(prompt, tools, model, temperature)
+                    st.markdown(response)
+                elif mode == "Streaming":
                     response = _stream_response(
                         prompt, skills, tools, model, temperature,
                         st.session_state.thread_id,
@@ -93,6 +98,30 @@ def render_main_view(
 
         # Append this turn to the UI store
         st.session_state.messages.append({"role": "ai", "content": response})
+
+
+# ---------------------------------------------------------------------------
+# Planner (multi-agent) helper
+# ---------------------------------------------------------------------------
+
+
+def _run_planner(
+    prompt: str,
+    tools: list[BaseTool],
+    model: str,
+    temperature: float,
+) -> str:
+    """Route the prompt through the multi-agent orchestrator.
+
+    Returns a fenced block so the time-blocked schedule keeps its alignment when
+    rendered as markdown (both live and when replayed from chat history).
+    """
+    from agents.orchestrator import build_orchestrator
+    from core.common_tools import get_today_date
+
+    orchestrator = build_orchestrator(tools, model, temperature)
+    result = orchestrator.run(prompt, date=get_today_date.invoke({}))
+    return f"```text\n{result}\n```"
 
 
 # ---------------------------------------------------------------------------
@@ -113,15 +142,16 @@ def _stream_response(
     Returns the final concatenated text so it can be stored in chat history.
     """
     placeholder = st.empty()
-    plan_text = ""
+    loaded_skills: list[str] = []
     thinking = ""
     response = ""
 
     for chunk in run_agent_with_skills(
         prompt, skills, tools, model, temperature, thread_id
     ):
-        if chunk.type == "plan":
-            plan_text = chunk.content
+        if chunk.type == "skill":
+            if chunk.content not in loaded_skills:
+                loaded_skills.append(chunk.content)
         elif chunk.type == "reasoning":
             thinking += chunk.reasoning
         elif chunk.type == "text":
@@ -129,10 +159,11 @@ def _stream_response(
 
         # Build live display
         display = ""
-        if plan_text:
+        if loaded_skills:
+            badges = ", ".join(f"<code>{name}</code>" for name in loaded_skills)
             display += (
-                f"<details><summary>🗺️ <strong>Skill routing</strong>: "
-                f"<code>{plan_text}</code></summary></details>\n\n"
+                f"<details><summary>🧩 <strong>Skills loaded</strong>: "
+                f"{badges}</summary></details>\n\n"
             )
         if thinking:
             display += f"🤔 **Thinking:**\n```text\n{thinking}\n```\n\n"

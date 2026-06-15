@@ -24,7 +24,11 @@ def render_sidebar():
 
     mode = st.sidebar.selectbox(
         "Agent Mode",
-        options=["Normal", "Streaming"],
+        options=["Normal", "Streaming", "Planner (Multi-Agent)"],
+        help=(
+            "Normal/Streaming: the skill-aware assistant. "
+            "Planner: the multi-agent orchestrator (TodoAgent → DailyPlannerAgent)."
+        ),
     )
 
     if st.sidebar.button("🧹 Clear Agent Cache", use_container_width=True):

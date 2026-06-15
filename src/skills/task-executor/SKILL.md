@@ -18,9 +18,19 @@ This skill handles all direct operations on tasks: creating new ones, reading de
 
 ---
 
-## MCP Tools Available
+## Tools You Can Call
 
-Connect to the task MCP server (HTTP) and use these tools:
+These tools are already bound to you — call them directly by name (no setup or
+connection step needed).
+
+**Date helpers (always available):**
+
+| Tool | Purpose |
+|---|---|
+| `get_today_date` | Today's date as `YYYY-MM-DD` — use to resolve "today"/relative dates |
+| `get_current_weekday` | The weekday name, e.g. `"Monday"` |
+
+**Task tools (from the task MCP server):**
 
 | Tool | Signature | Purpose |
 |---|---|---|
@@ -32,6 +42,10 @@ Connect to the task MCP server (HTTP) and use these tools:
 | `delete_task_by_id` | `task_id` | Permanently delete a task |
 | `get_today_task` | _(none)_ | List today's tasks (use to find task IDs by name) |
 
+> If the task tools are unavailable (none appear when you try to call one), tell
+> the user the task service isn't reachable right now — do **not** fabricate a
+> result or pretend the action succeeded.
+
 ---
 
 ## Operation Reference
@@ -41,7 +55,7 @@ Connect to the task MCP server (HTTP) and use these tools:
 
 **Steps**:
 1. Extract `name` (required), and optionally `description`, `priority`, `status`, `due_date`.
-2. If `due_date` is mentioned as "today", use today's date in `YYYY-MM-DD` format.
+2. For any relative due date ("today", "tomorrow", "next Monday"), call `get_today_date` first and compute the absolute `YYYY-MM-DD` from it — never guess the date.
 3. If priority is not specified, default is `"medium"`.
 4. Call `create_task(...)`.
 5. Confirm creation: "✅ Task **[name]** created with [priority] priority, due [date]."
@@ -146,7 +160,7 @@ When the user refers to a task by **name** (not ID):
 - **Validate input before calling tools**:
   - `status` must be exactly `"pending"`, `"in_progress"`, or `"done"` — reject anything else.
   - `priority` must be exactly `"low"`, `"medium"`, or `"high"`.
-  - `due_date` must be a valid date in `YYYY-MM-DD` format.
+  - `due_date` must be a valid date in `YYYY-MM-DD` format; resolve any relative date ("tomorrow", "Friday") against `get_today_date` rather than guessing.
 
 ---
 

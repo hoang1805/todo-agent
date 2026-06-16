@@ -3,7 +3,7 @@
 A single LangGraph tool-calling agent handles the whole request:
 
 * Its system prompt lists every skill's **name + description** only.
-* It is given a ``get_skill_detail`` tool (see :mod:`core.skills`) to load a
+* It is given a ``get_skill_detail`` tool (see :mod:`core.tools.skill_tools`) to load a
   skill's **full instructions** on demand, plus the live MCP tools.
 
 The model therefore routes itself — it decides when a skill is relevant and
@@ -27,13 +27,14 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import InMemorySaver
 
-from core.common_tools import make_common_tools
-from core.llm_client import create_ollama_model
-from core.prompts import load_prompt
-from core.skills import GET_SKILL_DETAIL, format_skill_roster, make_skill_tools
+from core.services.llm_client import create_ollama_model
+from core.services.prompts import load_prompt
+from core.services.skills import format_skill_roster
+from core.tools.common_tools import make_common_tools
+from core.tools.skill_tools import GET_SKILL_DETAIL, make_skill_tools
 
 if TYPE_CHECKING:
-    from core.models import Skill
+    from models.skill import Skill
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +280,7 @@ def run_task_agent(
 
 async def load_tools_async(servers: dict[str, str]) -> list[BaseTool]:
     """Async helper to fetch MCP tools — call once at startup."""
-    from core.mcp_client import get_mcp_tools  # local import avoids circular dep
+    from core.services.mcp_client import get_mcp_tools  # local import avoids circular dep
 
     try:
         return await get_mcp_tools(servers)

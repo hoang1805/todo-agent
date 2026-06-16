@@ -1,14 +1,16 @@
 """TodoAgent's validate-and-retry boundary — the 'never pass garbage' rule."""
 
 import pytest
+from pydantic import ValidationError
 
 from agents.todo_agent import (
     ContractError,
     TodoAgent,
     heuristic_normalize,
+    heuristic_parse_mutation,
     sample_raw_tasks,
 )
-from core.contract import TaskList
+from models.contract import CrudOp, Priority, Status, TaskList, TaskMutation
 
 
 def test_heuristic_normalize_fills_gaps_and_validates():
@@ -63,3 +65,55 @@ def test_todo_agent_raises_recoverable_error_after_exhausting_retries():
         agent.run()
     assert exc_info.value.attempts == 2
     assert len(exc_info.value.errors) == 2
+
+
+# -- CRUD: the mutation contract (the write-side checkpoint) -----------------
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(op=CrudOp.create),                       # create needs a title
+        dict(op=CrudOp.update, task_id="1"),          # update needs ≥1 field
+        dict(op=CrudOp.update, status=Status.done),   # update needs a task_id
+        dict(op=CrudOp.delete),                       # delete needs a task_id
+    ],
+)
+def test_task_mutation_rejects_underspecified_changes(kwargs):
+    with pytest.raises(ValidationError):
+        TaskMutation(**kwargs)
+
+
+def test_task_mutation_accepts_well_formed_changes():
+    assert TaskMutation(op=CrudOp.create, title="Call bank").op is CrudOp.create
+    assert TaskMutation(op=CrudOp.update, task_id="1", status=Status.done).changed_fields == {
+        "status": Status.done
+    }
+    assert TaskMutation(op=CrudOp.delete, task_id="9").task_id == "9"
+
+
+# -- CRUD: the heuristic parser + TodoAgent.parse_mutation -------------------
+
+_CURRENT = [{"id": "5", "title": "Gym"}, {"id": "7", "title": "Finish Q3 report"}]
+
+
+def test_heuristic_parse_create_strips_command_prefix():
+    m = heuristic_parse_mutation("add a task to call the bank, high priority", [])
+    assert m.op is CrudOp.create
+    assert m.title == "call the bank, high priority"
+    assert m.priority is Priority.high
+
+
+def test_heuristic_parse_delete_and_update_resolve_task_id():
+    deleted = heuristic_parse_mutation("delete the Gym task", _CURRENT)
+    assert deleted.op is CrudOp.delete and deleted.task_id == "5"
+
+    done = heuristic_parse_mutation("mark Finish Q3 report as done", _CURRENT)
+    assert done.op is CrudOp.update and done.task_id == "7" and done.status is Status.done
+
+
+def test_parse_mutation_raises_recoverable_error_when_unresolved():
+    # "delete" with no matching current task -> task_id stays None -> invalid.
+    agent = TodoAgent(fetch_raw=lambda: _CURRENT, max_retries=2)
+    with pytest.raises(ContractError):
+        agent.parse_mutation("delete some task that does not exist")

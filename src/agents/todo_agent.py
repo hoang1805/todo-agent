@@ -1,7 +1,7 @@
 """TodoAgent — the data specialist.
 
 Its single job: turn whatever the task store returns (raw, messy dicts) into a
-**schema-validated** :class:`~core.contract.TaskList` that the planner can trust.
+**schema-validated** :class:`~models.contract.TaskList` that the planner can trust.
 Normalization means: fill in an estimated duration, assign a category, and a
 priority — then validate.
 
@@ -27,7 +27,7 @@ from typing import Callable
 
 from pydantic import ValidationError
 
-from core.contract import Priority, Task, TaskList
+from models.contract import CrudOp, Priority, Status, Task, TaskList, TaskMutation
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 RawFetcher = Callable[[], list[dict]]
 #: A function that turns raw records into a validated, normalized TaskList.
 Normalizer = Callable[[list[dict]], TaskList]
+#: A function that turns a request + current tasks into a validated TaskMutation.
+MutationParser = Callable[[str, list[dict]], TaskMutation]
 
 
 class ContractError(Exception):
@@ -90,7 +92,7 @@ def heuristic_normalize(raw: list[dict]) -> TaskList:
         category = record.get("category") or _infer_category(title)
         tasks.append(
             Task(
-                id=int(record.get("id", index)),
+                id=record.get("id") or index,  # opaque id; fall back to position
                 title=title,
                 priority=priority,
                 est_minutes=est,
@@ -113,8 +115,8 @@ def llm_normalize(
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    from core.llm_client import create_ollama_model
-    from core.prompts import load_prompt
+    from core.services.llm_client import create_ollama_model
+    from core.services.prompts import load_prompt
 
     schema = TaskList.model_json_schema()
     llm = create_ollama_model(
@@ -129,6 +131,103 @@ def llm_normalize(
     )
     # Validate on the way IN. If this raises, run() retries the step.
     return TaskList.model_validate_json(response.content)
+
+
+# ---------------------------------------------------------------------------
+# Mutation parsers (CRUD) — turn a request into a validated TaskMutation
+# ---------------------------------------------------------------------------
+
+# Leading phrases stripped off a "create" request to recover the bare title.
+_CREATE_PREFIXES = (
+    "add a task to ", "add a task ", "add task to ", "add task ", "add ",
+    "create a task to ", "create a task ", "create task ", "create ",
+    "new task to ", "new task ", "remind me to ", "schedule a ", "schedule ",
+)
+_DELETE_KEYWORDS = ("delete", "remove", "cancel", "drop")
+_DONE_KEYWORDS = ("mark", "complete", "finish", " done")
+
+
+def _resolve_task_id(text: str, current_tasks: list[dict]) -> str | None:
+    """Best-effort: find a current task whose title appears in *text*."""
+    low = text.lower()
+    for record in current_tasks:
+        title = str(record.get("title") or record.get("name") or "").strip()
+        if title and title.lower() in low and record.get("id") is not None:
+            return str(record["id"])
+    return None
+
+
+def heuristic_parse_mutation(user_input: str, current_tasks: list[dict]) -> TaskMutation:
+    """Parse a CRUD request without an LLM (offline demo / tests / fallback).
+
+    Deterministic keyword rules: delete/remove → delete, mark/complete/done →
+    update status, otherwise create. Constructs a :class:`TaskMutation`, so the
+    contract validation still runs — an unresolved ``task_id`` for update/delete
+    is rejected exactly as in the LLM path.
+    """
+    low = user_input.lower()
+
+    if any(kw in low for kw in _DELETE_KEYWORDS):
+        return TaskMutation(
+            op=CrudOp.delete, task_id=_resolve_task_id(user_input, current_tasks)
+        )
+
+    if any(kw in low for kw in _DONE_KEYWORDS):
+        return TaskMutation(
+            op=CrudOp.update,
+            task_id=_resolve_task_id(user_input, current_tasks),
+            status=Status.done,
+        )
+
+    title = user_input.strip()
+    for prefix in _CREATE_PREFIXES:
+        if low.startswith(prefix):
+            title = user_input[len(prefix):].strip()
+            break
+    priority = (
+        Priority.high if "high prio" in low
+        else Priority.low if "low prio" in low
+        else None
+    )
+    return TaskMutation(op=CrudOp.create, title=title, priority=priority)
+
+
+def llm_parse_mutation(
+    user_input: str,
+    current_tasks: list[dict],
+    model_name: str,
+    temperature: float = 0.0,
+) -> TaskMutation:
+    """Parse a CRUD request via Ollama structured output, then validate.
+
+    The JSON schema is generated *from* :class:`TaskMutation`, and the current
+    task list is supplied so the model can resolve a reference like "the gym
+    task" to its ``task_id``. Validation runs on the way in; on failure
+    :meth:`TodoAgent.parse_mutation` retries the step.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from core.services.llm_client import create_ollama_model
+    from core.services.prompts import load_prompt
+
+    schema = TaskMutation.model_json_schema()
+    llm = create_ollama_model(
+        model_name, temperature, format=schema, with_thinking=False
+    )
+    system = load_prompt("crud_agent_system")
+    response = llm.invoke(
+        [
+            SystemMessage(content=system),
+            HumanMessage(
+                content=(
+                    f"Current tasks:\n{json.dumps(current_tasks, default=str)}\n\n"
+                    f"Request:\n{user_input}"
+                )
+            ),
+        ]
+    )
+    # Validate on the way IN. If this raises, parse_mutation() retries the step.
+    return TaskMutation.model_validate_json(response.content)
 
 
 # ---------------------------------------------------------------------------
@@ -164,10 +263,12 @@ class TodoAgent:
         self,
         fetch_raw: RawFetcher,
         normalize: Normalizer = heuristic_normalize,
+        parse: MutationParser = heuristic_parse_mutation,
         max_retries: int = 2,
     ) -> None:
         self._fetch_raw = fetch_raw
         self._normalize = normalize
+        self._parse = parse
         self.max_retries = max_retries
 
     def run(self) -> TaskList:
@@ -193,6 +294,37 @@ class TodoAgent:
 
         raise ContractError(
             "Could not normalize tasks into a valid TaskList.",
+            attempts=self.max_retries,
+            errors=errors,
+        )
+
+    def parse_mutation(self, user_input: str) -> TaskMutation:
+        """Parse a CRUD request into a validated TaskMutation, retrying on bad output.
+
+        Fetches the current tasks first (so a reference like "the gym task" can
+        be resolved to an id), then runs the injected parser under the same
+        validate-and-retry rule as :meth:`run`: a malformed or under-specified
+        change never escapes downstream — it raises a recoverable
+        :class:`ContractError` instead, which the caller surfaces to the user.
+        """
+        current = self._fetch_raw()
+
+        errors: list[str] = []
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                mutation = self._parse(user_input, current)
+                logger.info(
+                    "TodoAgent parsed a '%s' mutation on attempt %d",
+                    mutation.op.value,
+                    attempt,
+                )
+                return mutation
+            except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("Mutation parse attempt %d failed: %s", attempt, exc)
+                errors.append(str(exc))
+
+        raise ContractError(
+            "Could not parse the request into a valid task change.",
             attempts=self.max_retries,
             errors=errors,
         )

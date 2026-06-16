@@ -2,8 +2,15 @@
 
 import pytest
 
-from agents.orchestrator import Intent, Orchestrator, classify_intent, format_summary
-from agents.planner_agent import DailyPlannerAgent
+from agents.orchestrator import (
+    Intent,
+    Orchestrator,
+    classify_intent,
+    format_summary,
+    is_crud_intent,
+    matched_intent_families,
+)
+from agents.planner_agent import DailyPlannerAgent, Workday
 from agents.todo_agent import ContractError, TodoAgent, heuristic_normalize, sample_raw_tasks
 
 
@@ -16,6 +23,10 @@ from agents.todo_agent import ContractError, TodoAgent, heuristic_normalize, sam
         ("show me my tasks", Intent.summary),
         ("add a task to call the bank", Intent.add),
         ("remind me to buy milk", Intent.add),
+        ("delete the gym task", Intent.delete),
+        ("remove task 3", Intent.delete),
+        ("mark the report as done", Intent.update),
+        ("set priority of task 2 to high", Intent.update),
         ("hello there", Intent.unknown),
     ],
 )
@@ -23,9 +34,25 @@ def test_classify_intent(text, expected):
     assert classify_intent(text) == expected
 
 
-def _orchestrator(available_minutes=480, fetch_raw=sample_raw_tasks):
+def test_is_crud_intent():
+    assert all(is_crud_intent(i) for i in (Intent.add, Intent.update, Intent.delete))
+    assert not any(
+        is_crud_intent(i) for i in (Intent.plan, Intent.summary, Intent.unknown)
+    )
+
+
+def test_matched_intent_families_detects_single_and_multi():
+    # Single family.
+    assert set(matched_intent_families("plan my day")) == {Intent.plan}
+    # Multi-step: both "add" and "plan" present -> two families.
+    families = set(matched_intent_families("plan my day and add a task"))
+    assert {Intent.add, Intent.plan} <= families
+    assert len(families) > 1
+
+
+def _orchestrator(workday=None, fetch_raw=sample_raw_tasks):
     todo = TodoAgent(fetch_raw=fetch_raw, normalize=heuristic_normalize)
-    planner = DailyPlannerAgent(available_minutes=available_minutes)
+    planner = DailyPlannerAgent(workday=workday) if workday else DailyPlannerAgent()
     return Orchestrator(todo, planner)
 
 
@@ -36,7 +63,8 @@ def test_plan_route_produces_schedule():
 
 
 def test_plan_route_reports_overload():
-    out = _orchestrator(available_minutes=120).run("plan my day")
+    tight = Workday(start="09:00", end="11:00", breaks=())
+    out = _orchestrator(workday=tight).run("plan my day")
     assert "overloaded" in out.lower()
     assert "deferred" in out.lower()
 
@@ -62,6 +90,6 @@ def test_contract_error_is_surfaced_recoverably():
 
 
 def test_format_summary_empty():
-    from core.contract import TaskList
+    from models.contract import TaskList
 
     assert "no tasks" in format_summary(TaskList(tasks=[])).lower()

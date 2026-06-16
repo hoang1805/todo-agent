@@ -2,7 +2,7 @@
 
 Usage::
 
-    from core.prompts import load_prompt
+    from core.services.prompts import load_prompt
 
     system = load_prompt("planner_system")          # no extension needed
     template = load_prompt("planner_skills_block")
@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# Prompts live next to this file's parent directory (i.e. src/prompts/)
-_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+# Prompts live under src/ (this file is src/core/services/prompts.py)
+_PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 
 
 def load_prompt(name: str) -> str:

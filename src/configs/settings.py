@@ -30,3 +30,8 @@ MCP_SERVERS = {
 # Resolved relative to the package so it works regardless of the current
 # working directory.
 SKILL_SOURCES = os.getenv("SKILL_SOURCES", str(_SRC_DIR / "skills"))
+
+# Persistent LangGraph checkpointer (SQLite). Stored at the project root so a
+# pending human-in-the-loop approval can be resumed across restarts. Set
+# ``CHECKPOINT_DB=""`` to disable persistence (falls back to an in-memory saver).
+CHECKPOINT_DB = os.getenv("CHECKPOINT_DB", str(_SRC_DIR.parent / "agent-checkpoints.db"))

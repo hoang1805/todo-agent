@@ -14,7 +14,7 @@ from agents.orchestrator import (
     make_normalizer,
 )
 from agents.todo_agent import heuristic_normalize, sample_raw_tasks
-from core.contract import TaskList
+from models.contract import TaskList
 
 
 # -- _coerce_raw -------------------------------------------------------------

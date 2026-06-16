@@ -3,7 +3,7 @@ from __future__ import annotations
 import streamlit as st
 
 import configs.settings as cfg
-from core.skills import load_skills
+from core.services.skills import load_skills
 from ui.main_view import render_main_view
 from ui.sidebar import render_sidebar
 

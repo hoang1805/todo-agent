@@ -24,10 +24,10 @@ def render_sidebar():
 
     mode = st.sidebar.selectbox(
         "Agent Mode",
-        options=["Normal", "Streaming", "Planner (Multi-Agent)"],
+        options=["Planner (Multi-Agent)", "Streaming", "Normal"],
         help=(
-            "Normal/Streaming: the skill-aware assistant. "
-            "Planner: the multi-agent orchestrator (TodoAgent → DailyPlannerAgent)."
+            "Planner: the multi-agent orchestrator (plan / summarize / multi-step). "
+            "Streaming & Normal: the general chat assistant (with MCP tools)."
         ),
     )
 

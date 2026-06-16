@@ -27,6 +27,11 @@ to the work that uses it.
 Conversation state persists across turns via a shared LangGraph checkpointer keyed by
 `thread_id`.
 
+> The day-to-day task work (planning, summarizing, CRUD) now lives in the **multi-agent
+> planner** below, which is the default mode. The skill-aware chat agent is kept as a
+> general assistant; **no skills ship by default** — drop a `SKILL.md` into `src/skills/`
+> to add one.
+
 ## Multi-agent planner
 
 Alongside the skill-aware assistant there is a **multi-agent daily planner**, selectable
@@ -38,7 +43,7 @@ orchestrator classifies the request and routes it to specialist agents that comm
 user prompt
    │
    ▼
-Orchestrator ── classify intent (plan | summary | add)
+Orchestrator ── classify intent (plan | summary | create/update/delete)
    │
    ▼
 TodoAgent (data specialist)
@@ -48,9 +53,9 @@ TodoAgent (data specialist)
    │   (malformed model output is caught and retried, never passed on)
    ▼
 DailyPlannerAgent (reasoning specialist)
-   • rank → time-block across the available hours
+   • rank by priority → fit into the working hours, around meal breaks
    • DECISION: does it all fit?           ◄── what makes it an agent
-       ├─ yes → schedule everything
+       ├─ yes → schedule everything (lunch/dinner kept clear)
        └─ no  → defer the lowest-priority tasks, report what was dropped
    │
    ▼
@@ -59,15 +64,41 @@ Orchestrator → formatted, time-blocked day
 
 **Design choices**
 
-- **The contract is the linchpin** ([`core/contract.py`](src/core/contract.py)). `Task`/`TaskList`
+- **The contract is the linchpin** ([`models/contract.py`](src/models/contract.py)). `Task`/`TaskList`
   are bounded Pydantic models (`est_minutes` is range-checked, extra fields are forbidden),
   so a hallucinated task **cannot** flow downstream — it fails validation and the step retries.
-- **The overload decision is deterministic Python** ([`agents/planner_agent.py`](src/agents/planner_agent.py)),
-  not an LLM call. That keeps the graded "what do I cut?" behaviour reliable and unit-testable
-  without a model running.
-- **The orchestrator is plain Python** ([`agents/orchestrator.py`](src/agents/orchestrator.py)) —
-  intent classification falls back to keyword rules, and every agent is registered in **one place**
-  (`build_orchestrator`), so adding a third agent is a single new branch.
+- **The planner fits a real day, deterministically** ([`agents/planner_agent.py`](src/agents/planner_agent.py)).
+  A `Workday` (start, end, meal breaks) defines the timeline; tasks are ranked by priority and laid out
+  around lunch/dinner, and whatever doesn't fit is deferred. It's pure Python — no LLM call — so the
+  graded "what do I cut?" behaviour stays reliable and unit-testable.
+- **Writes go through a confirmed CRUD path.** A create/update/delete request takes a dedicated
+  deterministic route in the graph: `TodoAgent` parses it into a **validated `TaskMutation`** (the
+  write-side contract in [`models/contract.py`](src/models/contract.py) — an under-specified change,
+  e.g. a delete with no task identified, is rejected and retried), the graph **pauses for human
+  approval** (LangGraph `interrupt`), the change is applied via the MCP write tools, and the day is
+  **re-planned** so you see the effect. Reads stay autonomous. (The generic agent⇄tools loop also
+  gates its mutating tools, via [`agents/human_in_the_loop.py`](src/agents/human_in_the_loop.py).)
+- **Approvals survive restarts.** The graph is compiled with a **persistent SQLite checkpointer**
+  ([`core/services/checkpoint.py`](src/core/services/checkpoint.py)), so a pending approval — and the
+  conversation thread — can be resumed even after the process restarts. It falls back to an in-memory
+  saver when the SQLite checkpointer isn't installed.
+- **Two orchestrator implementations, same agents.** A plain-Python one
+  ([`agents/orchestrator.py`](src/agents/orchestrator.py)) — a `match` on intent, clearest to read —
+  and a LangGraph one ([`agents/graph_orchestrator.py`](src/agents/graph_orchestrator.py)) where each
+  step is a **node**, routing is **edges**, and the contract is a typed field on the shared **state**.
+  Both register every agent in **one place** (`build_orchestrator` / `build_graph_orchestrator`), so
+  adding a third agent is a single new branch/node. The Streamlit **Planner** mode uses the graph.
+- **Complex / multi-step prompts loop — and the loop is an edge.** The graph's open-ended path is the
+  classic ReAct cycle `agent → tools → agent → … → END`: a **tool-calling agent** decides which tool to
+  call, a `ToolNode` runs it, and a **conditional edge** (`should_continue`) routes back to the agent
+  while tool calls remain. The loop's memory is the message list in state, bounded by `recursion_limit`.
+  The deterministic capabilities are themselves exposed as tools (`plan_my_day`, `summarize_tasks`)
+  alongside **all** the local helper tools and the MCP CRUD tools, so a request like *"add a task, then
+  re-plan my day, then show my list"* is sequenced by the loop, one tool per iteration. A prompt that
+  matches more than one intent family is routed here automatically; single `plan`/`summary` requests stay
+  on the loop-free deterministic path.
+- **The agent knows its tools.** The loop's system prompt is built from the live tool set (name +
+  one-line description for every bound tool), so the model is told exactly what it can call.
 - **Graceful degradation.** With the MCP server down it uses sample tasks; with Ollama down it uses
   a deterministic heuristic normalizer and keyword classification — the mode still works offline.
 
@@ -81,7 +112,7 @@ Orchestrator → formatted, time-blocked day
 
 ```bash
 python src/run_orchestrator.py "plan my day"
-python src/run_orchestrator.py "plan my day" --available-minutes 180   # force an overload
+python src/run_orchestrator.py "plan my day" --day-end 12:00   # short day -> overload
 python src/run_orchestrator.py "what's on my list?"
 ```
 
@@ -93,6 +124,11 @@ pytest tests/ -q
 
 ## Project layout
 
+This project and the [task MCP server](../mcps/task-mcp) share one skeleton —
+`models/` (data), `core/services/` (logic + clients), `core/tools/` (tool
+factories), `configs/`, and `utils/` — so the same mental map carries across
+both. The agent app adds `agents/`, `prompts/`, `skills/`, and `ui/` on top.
+
 ```
 src/
 ├── app.py                  # Streamlit entrypoint: load skills + MCP tools, render UI
@@ -101,24 +137,32 @@ src/
 │   ├── ollama_agent.py     # The single skill-aware agent + streaming bridge
 │   ├── todo_agent.py       # Multi-agent: data specialist (raw → validated TaskList)
 │   ├── planner_agent.py    # Multi-agent: reasoning specialist (rank, time-block, defer)
-│   └── orchestrator.py     # Multi-agent: classify intent + route + runtime wiring
+│   ├── orchestrator.py     # Multi-agent: plain-Python classify + route + runtime wiring
+│   ├── graph_orchestrator.py # Multi-agent: LangGraph StateGraph (nodes/edges + agent⇄tools loop)
+│   └── human_in_the_loop.py  # Approval gate (interrupt) wrapping mutating tools
+├── models/                 # Data models, no I/O
+│   ├── contract.py         # Handoff contract (Task, TaskList, DayPlan) + write contract (TaskMutation)
+│   └── skill.py            # Skill (SKILL.md parser)
 ├── core/
-│   ├── contract.py         # Pydantic handoff contract (Task, TaskList, DayPlan)
-│   ├── common_tools.py     # Always-available native @tool helpers (get_today_date, …)
-│   ├── llm_client.py       # ChatOllama factory
-│   ├── mcp_client.py       # MCP server connection + tool loading
-│   ├── models.py           # Skill (SKILL.md parser)
-│   ├── prompts.py          # Loads prompts from src/prompts/
-│   └── skills.py           # Skill loading, roster formatting, get_skill_detail tool
+│   ├── services/           # Business logic + external clients
+│   │   ├── checkpoint.py   #   Persistent (SQLite) LangGraph checkpointer, in-memory fallback
+│   │   ├── llm_client.py   #   ChatOllama factory
+│   │   ├── mcp_client.py   #   MCP server connection + tool loading
+│   │   ├── prompts.py      #   Loads prompts from src/prompts/
+│   │   └── skills.py       #   Skill loading + roster formatting
+│   └── tools/              # LangChain tool factories
+│       ├── common_tools.py #   Always-available native @tool helpers (get_today_date, …)
+│       └── skill_tools.py  #   get_skill_detail — the on-demand skill loader tool
 ├── prompts/
 │   ├── agent_system.md            # Skill-agent system prompt ({skills_roster} slot)
 │   ├── todo_agent_system.md       # TodoAgent normalization prompt
-│   └── intent_classifier_system.md# Orchestrator intent prompt
-├── skills/
-│   ├── daily-planner/SKILL.md
-│   └── task-executor/SKILL.md
+│   ├── crud_agent_system.md       # TodoAgent CRUD-request parsing prompt
+│   ├── intent_classifier_system.md# Orchestrator intent prompt
+│   └── complex_agent_system.md    # Tool-agent prompt for the graph's loop path
+├── skills/                 # Optional chat-agent skills (none shipped by default)
 ├── ui/                     # Streamlit sidebar + main chat view
-└── configs/settings.py     # Config (env-overridable)
+├── configs/settings.py     # Config (env-overridable)
+└── utils/json_utils.py     # Generic JSON helpers
 
 tests/                      # Unit tests (no LLM / MCP required)
 ```
@@ -153,6 +197,7 @@ variables (a `.env` file at the project root is loaded automatically):
 | `OLLAMA_HOST`        | `http://localhost:11434`      | Ollama server URL                |
 | `TASK_MCP_URL`       | `http://localhost:8000/sse`   | Task MCP server SSE endpoint     |
 | `SKILL_SOURCES`      | `src/skills`                  | Directory scanned for `SKILL.md` |
+| `CHECKPOINT_DB`      | `agent-checkpoints.db`        | SQLite file for the persistent checkpointer (set empty to disable) |
 
 ## Adding a skill
 

@@ -1,7 +1,17 @@
 """The planner's decision — exercised with no LLM running."""
 
-from agents.planner_agent import DailyPlannerAgent, plan_day, rank_tasks
-from core.contract import Task, TaskList
+from agents.planner_agent import (
+    Break,
+    DailyPlannerAgent,
+    Workday,
+    plan_day,
+    rank_tasks,
+    working_minutes,
+)
+from models.contract import Task, TaskList
+
+# A break-free workday makes the contiguous-scheduling assertions simple.
+NO_BREAKS = Workday(start="09:00", end="18:00", breaks=())
 
 
 def _tl(*specs) -> TaskList:
@@ -25,12 +35,19 @@ def test_ranking_orders_by_priority_then_due_then_size():
         (4, "medium", 15),
     )
     ranked = [t.id for t in rank_tasks(tl.tasks)]
-    assert ranked == [3, 2, 4, 1]
+    assert ranked == ["3", "2", "4", "1"]
+
+
+def test_working_minutes_excludes_breaks():
+    # 09:00–18:00 = 540 min, minus a 60-min lunch = 480.
+    wd = Workday(start="09:00", end="18:00", breaks=(Break("Lunch", "12:00", "13:00"),))
+    assert working_minutes(wd) == 480
+    assert working_minutes(NO_BREAKS) == 540
 
 
 def test_normal_day_schedules_everything():
     tl = _tl((1, "high", 120), (2, "medium", 60), (3, "low", 45))
-    plan = plan_day(tl, available_minutes=480, day_start="09:00")
+    plan = plan_day(tl, workday=NO_BREAKS)
 
     assert plan.overloaded is False
     assert plan.deferred == []
@@ -42,8 +59,20 @@ def test_normal_day_schedules_everything():
     assert plan.scheduled_minutes == 225
 
 
+def test_tasks_schedule_around_a_break():
+    # A 90-min task starting at 11:00 would cross a 12:00–13:00 lunch, so it is
+    # pushed to after lunch.
+    wd = Workday(start="11:00", end="18:00", breaks=(Break("Lunch", "12:00", "13:00"),))
+    plan = plan_day(_tl((1, "high", 90)), workday=wd)
+
+    assert [b.start for b in plan.blocks] == ["13:00"]
+    assert plan.blocks[0].end == "14:30"
+    # The meal block is reported so the UI can show it.
+    assert [(m.name, m.start, m.end) for m in plan.breaks] == [("Lunch", "12:00", "13:00")]
+
+
 def test_overloaded_day_defers_lowest_priority():
-    # Total 390 min but only 180 available -> the day cannot fit.
+    # Total 390 min but only a 3-hour window -> the day cannot fit it all.
     tl = _tl(
         (1, "high", 120),
         (2, "high", 60),
@@ -51,19 +80,28 @@ def test_overloaded_day_defers_lowest_priority():
         (4, "low", 60),
         (5, "low", 90),
     )
-    plan = plan_day(tl, available_minutes=180)
+    plan = plan_day(tl, workday=Workday(start="09:00", end="12:00", breaks=()))
 
     assert plan.overloaded is True
     # High-priority work is scheduled; low-priority is what gets dropped.
     scheduled_ids = {b.task_id for b in plan.blocks}
     deferred_ids = {t.id for t in plan.deferred}
-    assert scheduled_ids == {1, 2}
-    assert deferred_ids == {3, 4, 5}
+    assert scheduled_ids == {"1", "2"}
+    assert deferred_ids == {"3", "4", "5"}
     assert plan.scheduled_minutes <= plan.available_minutes
 
 
-def test_planner_agent_carries_date_and_uses_its_budget():
-    agent = DailyPlannerAgent(available_minutes=60)
+def test_deferred_big_task_does_not_block_a_smaller_one():
+    # A 90-min task can't fit a 60-min window, but a later 30-min task can.
+    tl = _tl((1, "high", 90), (2, "high", 30))
+    plan = plan_day(tl, workday=Workday(start="09:00", end="10:00", breaks=()))
+
+    assert {b.task_id for b in plan.blocks} == {"2"}
+    assert {t.id for t in plan.deferred} == {"1"}
+
+
+def test_planner_agent_carries_date_and_defers_when_tight():
+    agent = DailyPlannerAgent(workday=Workday(start="09:00", end="10:00", breaks=()))
     plan = agent.run(_tl((1, "high", 60), (2, "low", 60)), date="2026-06-15")
 
     assert plan.date == "2026-06-15"
@@ -72,6 +110,6 @@ def test_planner_agent_carries_date_and_uses_its_budget():
 
 
 def test_empty_tasklist_produces_empty_plan():
-    plan = plan_day(TaskList(tasks=[]))
+    plan = plan_day(TaskList(tasks=[]), workday=NO_BREAKS)
     assert plan.blocks == []
     assert plan.overloaded is False

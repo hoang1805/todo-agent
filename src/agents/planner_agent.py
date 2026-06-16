@@ -1,29 +1,75 @@
 """DailyPlannerAgent — the reasoning specialist.
 
-Given a validated :class:`~core.contract.TaskList`, it ranks the tasks,
-time-blocks them across the available hours, and — the part that makes it an
-*agent* rather than a sorter — **decides what to do when the day is
-overloaded**: it defers the lowest-priority tasks and reports exactly what it
-dropped.
+Given a validated :class:`~models.contract.TaskList`, it ranks the tasks, fits them
+into the user's working hours **around fixed meal breaks** (lunch, dinner, …),
+and — the part that makes it an *agent* rather than a sorter — **decides what to
+do when the day is overloaded**: it defers the lowest-priority tasks and reports
+exactly what it dropped.
 
 The decision (:func:`plan_day`) is deterministic, pure Python. That is on
 purpose: it is the graded behaviour, so it must be reliable and unit-testable
-without an LLM. The LLM is used only for an optional human-friendly narrative
-on top of the already-made decision (:meth:`DailyPlannerAgent.narrate`).
+without an LLM.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from core.contract import DayPlan, Task, TaskList, TimeBlock
-
-# A standard work day: 8 hours.
-DEFAULT_AVAILABLE_MINUTES = 480
-DEFAULT_DAY_START = "09:00"
+from models.contract import DayPlan, MealBreak, Task, TaskList, TimeBlock
 
 #: Priority → emoji, shared by the plan and summary renderers.
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+
+
+# ---------------------------------------------------------------------------
+# Workday configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Break:
+    """A fixed block in the day that tasks must schedule around."""
+
+    name: str
+    start: str  # HH:MM, 24-hour
+    end: str  # HH:MM, 24-hour
+
+
+@dataclass(frozen=True)
+class Workday:
+    """The user's available hours and the meal breaks within them."""
+
+    start: str = "09:00"
+    end: str = "20:00"
+    breaks: tuple[Break, ...] = field(
+        default_factory=lambda: (
+            Break("Lunch", "12:00", "13:00"),
+            Break("Dinner", "18:00", "19:00"),
+        )
+    )
+
+
+DEFAULT_WORKDAY = Workday()
+
+
+def _t(hhmm: str) -> datetime:
+    return datetime.strptime(hhmm, "%H:%M")
+
+
+def _fmt(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
+
+def working_minutes(workday: Workday) -> int:
+    """Minutes available for tasks = the day window minus break time inside it."""
+    start, end = _t(workday.start), _t(workday.end)
+    total = int((end - start).total_seconds() // 60)
+    for brk in workday.breaks:
+        bs, be = max(_t(brk.start), start), min(_t(brk.end), end)
+        if be > bs:
+            total -= int((be - bs).total_seconds() // 60)
+    return max(total, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -37,13 +83,7 @@ def _due_sort_key(due: str | None) -> str:
 
 
 def rank_tasks(tasks: list[Task]) -> list[Task]:
-    """Order tasks for scheduling: priority first, then due date, then size.
-
-    * **Priority** is primary — high before medium before low.
-    * **Due date** breaks ties — sooner deadlines win.
-    * **Estimated size** breaks remaining ties — shorter tasks first, so when a
-      day is tight we fit more committed work in.
-    """
+    """Order tasks for scheduling: priority first, then due date, then size."""
     return sorted(
         tasks,
         key=lambda t: (t.priority.rank, _due_sort_key(t.due), t.est_minutes),
@@ -57,56 +97,73 @@ def rank_tasks(tasks: list[Task]) -> list[Task]:
 
 def plan_day(
     tasks: TaskList,
-    available_minutes: int = DEFAULT_AVAILABLE_MINUTES,
-    day_start: str = DEFAULT_DAY_START,
+    workday: Workday = DEFAULT_WORKDAY,
     date: str | None = None,
 ) -> DayPlan:
-    """Build a time-blocked day, deferring the lowest-priority overflow.
+    """Fit ranked tasks into the workday around its breaks; defer the overflow.
 
-    Walks the ranked tasks greedily, placing each into a contiguous slot while
-    it still fits the remaining budget. The first task that would overflow — and
-    every lower-ranked task after it — is **deferred** rather than scheduled.
-    Because the input is ranked by priority, the deferred set is always the
-    least important work, which is exactly the "what do I cut?" decision.
+    Walks a clock cursor from the day's start. For each ranked task it skips the
+    cursor past any break the task would straddle, then places the task if it
+    still ends by the day's end — otherwise the task is **deferred** (and, since
+    tasks are priority-ranked, the deferred set is always the least important
+    work). The cursor only advances on a successful placement, so a single big
+    task that doesn't fit doesn't block smaller tasks that still could.
 
-    Args:
-        tasks: The validated task list to plan.
-        available_minutes: Total minutes available to schedule (default 8h).
-        day_start: Clock time the day begins, ``HH:MM`` 24-hour.
-        date: Optional date label carried onto the resulting plan.
-
-    Returns:
-        A :class:`DayPlan`. ``plan.overloaded`` is ``True`` iff anything was
-        deferred.
+    Returns a :class:`DayPlan`; ``plan.overloaded`` is ``True`` iff anything was
+    deferred. Meal breaks within the window are returned in ``plan.breaks``.
     """
-    cursor = datetime.strptime(day_start, "%H:%M")
-    used = 0
+    start, end = _t(workday.start), _t(workday.end)
+    ordered_breaks = sorted(workday.breaks, key=lambda b: _t(b.start))
+
+    meal_blocks = [
+        MealBreak(name=b.name, start=b.start, end=b.end)
+        for b in ordered_breaks
+        if _t(b.end) > start and _t(b.start) < end
+    ]
+
+    cursor = start
     blocks: list[TimeBlock] = []
     deferred: list[Task] = []
 
     for task in rank_tasks(tasks.tasks):
-        if used + task.est_minutes <= available_minutes:
-            end = cursor + timedelta(minutes=task.est_minutes)
+        place = cursor
+        # Skip the placement cursor past any break this task would overlap.
+        while True:
+            duration = timedelta(minutes=task.est_minutes)
+            straddled = next(
+                (
+                    b
+                    for b in ordered_breaks
+                    if _t(b.start) < place + duration and _t(b.end) > place
+                ),
+                None,
+            )
+            if straddled is None:
+                break
+            place = max(place, _t(straddled.end))
+
+        block_end = place + timedelta(minutes=task.est_minutes)
+        if block_end <= end:
             blocks.append(
                 TimeBlock(
                     task_id=task.id,
                     title=task.title,
                     priority=task.priority,
-                    start=cursor.strftime("%H:%M"),
-                    end=end.strftime("%H:%M"),
+                    start=_fmt(place),
+                    end=_fmt(block_end),
                     est_minutes=task.est_minutes,
                 )
             )
-            used += task.est_minutes
-            cursor = end
+            cursor = block_end  # advance only when actually scheduled
         else:
             deferred.append(task)
 
     return DayPlan(
         date=date,
-        available_minutes=available_minutes,
+        available_minutes=working_minutes(workday),
         blocks=blocks,
         deferred=deferred,
+        breaks=meal_blocks,
     )
 
 
@@ -120,19 +177,27 @@ def format_plan(plan: DayPlan) -> str:
     header = f"🗓️  Your plan{f' for {plan.date}' if plan.date else ''}"
     lines = [header, ""]
 
-    if plan.blocks:
-        for b in plan.blocks:
-            lines.append(
-                f"  {b.start}–{b.end}  {PRIORITY_EMOJI[b.priority.value]} {b.title} "
-                f"({b.est_minutes} min)"
-            )
+    # Merge task blocks and meal breaks onto one timeline, ordered by start.
+    timeline: list[tuple[str, object]] = [("task", b) for b in plan.blocks]
+    timeline += [("break", m) for m in plan.breaks]
+    timeline.sort(key=lambda item: item[1].start)
+
+    if timeline:
+        for kind, item in timeline:
+            if kind == "task":
+                lines.append(
+                    f"  {item.start}–{item.end}  {PRIORITY_EMOJI[item.priority.value]} "
+                    f"{item.title} ({item.est_minutes} min)"
+                )
+            else:
+                lines.append(f"  {item.start}–{item.end}  🍽️ {item.name}")
     else:
         lines.append("  (nothing scheduled)")
 
     lines.append("")
     lines.append(
         f"Scheduled {plan.scheduled_minutes} of {plan.available_minutes} "
-        f"available minutes."
+        f"available working minutes."
     )
 
     if plan.overloaded:
@@ -153,23 +218,13 @@ class DailyPlannerAgent:
     """The reasoning specialist: turn a TaskList into a time-blocked DayPlan.
 
     The agent's *goal* is a realistic day; its *decision* is what to defer; its
-    *loop* is plan-then-(optionally)-narrate. The decision lives in
-    :func:`plan_day` so it can be exercised in tests with no model running.
+    *loop* is rank-then-fit. The decision lives in :func:`plan_day` so it can be
+    exercised in tests with no model running.
     """
 
-    def __init__(
-        self,
-        available_minutes: int = DEFAULT_AVAILABLE_MINUTES,
-        day_start: str = DEFAULT_DAY_START,
-    ) -> None:
-        self.available_minutes = available_minutes
-        self.day_start = day_start
+    def __init__(self, workday: Workday = DEFAULT_WORKDAY) -> None:
+        self.workday = workday
 
     def run(self, tasks: TaskList, date: str | None = None) -> DayPlan:
         """Make the planning decision and return the typed result."""
-        return plan_day(
-            tasks,
-            available_minutes=self.available_minutes,
-            day_start=self.day_start,
-            date=date,
-        )
+        return plan_day(tasks, workday=self.workday, date=date)

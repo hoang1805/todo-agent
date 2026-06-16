@@ -11,7 +11,7 @@ from agents.ollama_agent import AgentChunk, run_agent_with_skills, run_task_agen
 PLANNER_MODE = "Planner (Multi-Agent)"
 
 if TYPE_CHECKING:
-    from core.models import Skill
+    from models.skill import Skill
 
 
 
@@ -28,7 +28,7 @@ def render_main_view(
         model: Ollama model name selected in the sidebar.
         temperature: Creativity slider value.
         mode: ``"Streaming"`` or ``"Normal"``.
-        skills: All loaded :class:`~core.models.Skill` objects.
+        skills: All loaded :class:`~models.skill.Skill` objects.
         tools: Live MCP tools (may be an empty list if the server is down).
     """
     st.markdown("<h1>✨ AI Task Assistant</h1>", unsafe_allow_html=True)
@@ -48,7 +48,8 @@ def render_main_view(
             help="Number of tools loaded from the MCP server.",
         )
 
-    # Skills badge row
+    # Skills badge row (skills are optional — the Planner mode and chat agent
+    # both work without any).
     if skills:
         badge_row = "  ".join(
             f"`{s.name}`" for s in skills
@@ -58,8 +59,6 @@ def render_main_view(
             f"🧩 Active skills: {badge_row}</p>",
             unsafe_allow_html=True,
         )
-    else:
-        st.warning("No skills loaded — check your `SKILL_SOURCES` path in settings.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -74,17 +73,25 @@ def render_main_view(
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+    # Pending human-in-the-loop approval (Planner mode) — render until resolved.
+    if mode == PLANNER_MODE and st.session_state.get("planner_pending"):
+        _render_approval_panel(_get_planner(tools, model, temperature))
+
     # Handle new user input
     if prompt := st.chat_input("Ask your agent (e.g., What should I do today?)"):
-        st.chat_message("user").markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
 
+        if mode == PLANNER_MODE:
+            # The planner may pause for approval, so route through session state
+            # and rerun (the approval panel / result renders on the next pass).
+            with st.spinner("Planning…", show_time=True):
+                _start_planner_turn(_get_planner(tools, model, temperature), prompt)
+            st.rerun()
+
+        st.chat_message("user").markdown(prompt)
         with st.chat_message("ai"):
             with st.spinner("Agent is thinking…", show_time=True):
-                if mode == PLANNER_MODE:
-                    response = _run_planner(prompt, tools, model, temperature)
-                    st.markdown(response)
-                elif mode == "Streaming":
+                if mode == "Streaming":
                     response = _stream_response(
                         prompt, skills, tools, model, temperature,
                         st.session_state.thread_id,
@@ -101,27 +108,83 @@ def render_main_view(
 
 
 # ---------------------------------------------------------------------------
-# Planner (multi-agent) helper
+# Planner (multi-agent) helpers — with human-in-the-loop approval
 # ---------------------------------------------------------------------------
 
 
-def _run_planner(
-    prompt: str,
-    tools: list[BaseTool],
-    model: str,
-    temperature: float,
-) -> str:
-    """Route the prompt through the multi-agent orchestrator.
+def _get_planner(tools: list[BaseTool], model: str, temperature: float):
+    """Return a cached GraphOrchestrator (so its checkpointer survives reruns).
 
-    Returns a fenced block so the time-blocked schedule keeps its alignment when
-    rendered as markdown (both live and when replayed from chat history).
+    Rebuilt only when the model, temperature, or tool count changes — the
+    checkpointer must persist across reruns for approval/resume to work.
     """
-    from agents.orchestrator import build_orchestrator
-    from core.common_tools import get_today_date
+    import configs.settings as cfg
+    from agents.graph_orchestrator import build_graph_orchestrator
 
-    orchestrator = build_orchestrator(tools, model, temperature)
-    result = orchestrator.run(prompt, date=get_today_date.invoke({}))
-    return f"```text\n{result}\n```"
+    key = (model, round(temperature, 3), len(tools))
+    if st.session_state.get("planner_key") != key:
+        st.session_state.planner = build_graph_orchestrator(
+            tools, model, temperature, checkpointer_db=cfg.CHECKPOINT_DB or None
+        )
+        st.session_state.planner_key = key
+    return st.session_state.planner
+
+
+def _consume_planner_result(result) -> None:
+    """Turn a PlannerResult into chat output and/or a pending approval."""
+    if result.status == "done":
+        st.session_state.planner_pending = None
+        st.session_state.messages.append(
+            {"role": "ai", "content": f"```text\n{result.text}\n```"}
+        )
+        return
+
+    intr = result.interrupt or {}
+    st.session_state.planner_pending = {
+        "thread_id": result.thread_id,
+        "interrupt": intr,
+    }
+    st.session_state.messages.append(
+        {
+            "role": "ai",
+            "content": (
+                f"🔐 **Approval needed** to run `{intr.get('tool')}` "
+                f"with arguments `{intr.get('args')}`."
+            ),
+        }
+    )
+
+
+def _start_planner_turn(planner, prompt: str) -> None:
+    """Start a planner run for *prompt* (may pause for approval)."""
+    from core.tools.common_tools import get_today_date
+
+    result = planner.start(prompt, date=get_today_date.invoke({}))
+    _consume_planner_result(result)
+
+
+def _render_approval_panel(planner) -> None:
+    """Render Approve/Reject controls for a pending mutating action."""
+    pending = st.session_state.planner_pending
+    intr = pending["interrupt"]
+
+    st.warning(
+        f"**{intr.get('message', 'Approve this action?')}**\n\n"
+        f"Tool: `{intr.get('tool')}` — arguments: `{intr.get('args')}`"
+    )
+    approve, reject = st.columns(2)
+    if approve.button("✅ Approve", use_container_width=True, key="planner_approve"):
+        with st.spinner("Applying…"):
+            result = planner.resume(pending["thread_id"], {"action": "accept"})
+        _consume_planner_result(result)
+        st.rerun()
+    if reject.button("❌ Reject", use_container_width=True, key="planner_reject"):
+        with st.spinner("Cancelling…"):
+            result = planner.resume(
+                pending["thread_id"], {"action": "reject", "reason": "user declined"}
+            )
+        _consume_planner_result(result)
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------

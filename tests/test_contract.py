@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from core.contract import DayPlan, Priority, Task, TaskList, TimeBlock
+from models.contract import DayPlan, Priority, Task, TaskList, TimeBlock
 
 
 def _task(**overrides):
@@ -16,6 +16,15 @@ def test_valid_task_parses():
     task = _task(due="2026-06-15")
     assert task.priority is Priority.high
     assert task.due == "2026-06-15"
+
+
+def test_string_and_numeric_ids_are_accepted_as_strings():
+    # Real stores use codes / UUIDs; a number is coerced to its string form.
+    assert _task(id="W001").id == "W001"
+    assert _task(id="05b46062-3420-49c7-ab12-aa0e30fc3e68").id.startswith("05b4")
+    assert _task(id=7).id == "7"
+    payload = '{"tasks": [{"id": "AI-101", "title": "x", "priority": "low", "est_minutes": 30, "category": "general"}]}'
+    assert TaskList.model_validate_json(payload).tasks[0].id == "AI-101"
 
 
 def test_est_minutes_must_be_positive():

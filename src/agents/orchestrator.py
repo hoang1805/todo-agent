@@ -20,26 +20,30 @@ import asyncio
 import json
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from pydantic import ValidationError
 
 from agents.planner_agent import (
-    DEFAULT_AVAILABLE_MINUTES,
+    DEFAULT_WORKDAY,
     PRIORITY_EMOJI,
     DailyPlannerAgent,
+    Workday,
     format_plan,
 )
 from agents.todo_agent import (
     ContractError,
+    MutationParser,
     Normalizer,
     RawFetcher,
     TodoAgent,
     heuristic_normalize,
+    heuristic_parse_mutation,
     llm_normalize,
+    llm_parse_mutation,
     sample_raw_tasks,
 )
-from core.contract import TaskList
+from models.contract import CrudOp, TaskList, TaskMutation
 
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
@@ -53,7 +57,18 @@ class Intent(str, Enum):
     plan = "plan"
     summary = "summary"
     add = "add"
+    update = "update"
+    delete = "delete"
     unknown = "unknown"
+
+
+#: The write intents — all routed to the CRUD (validate → confirm → execute) path.
+_CRUD_INTENTS = (Intent.add, Intent.update, Intent.delete)
+
+
+def is_crud_intent(intent: Intent) -> bool:
+    """True for create/update/delete intents (the mutating, approval-gated path)."""
+    return intent in _CRUD_INTENTS
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +76,14 @@ class Intent(str, Enum):
 # ---------------------------------------------------------------------------
 
 # Ordered most-specific → least: the first bucket with a keyword hit wins.
+# CRUD buckets come first; their keywords are multi-word/space-bounded phrases so
+# they don't accidentally fire on plan/summary prompts (which would mis-route a
+# request to the agent loop via `matched_intent_families`).
 _INTENT_KEYWORDS: list[tuple[Intent, tuple[str, ...]]] = [
+    (Intent.delete, ("delete ", "remove ", "cancel the", "cancel task")),
+    (Intent.update, ("mark ", "complete ", "finish ", "rename ", "reschedule ",
+                      "update task", "set priority", "set status",
+                      "change priority", "change status", "as done", "is done")),
     (Intent.add, ("add ", "create ", "new task", "remind me to", "schedule a")),
     (Intent.plan, ("plan", "time block", "time-block", "organize my day",
                    "schedule my day", "what should i do")),
@@ -79,13 +101,28 @@ def classify_intent(user_input: str) -> Intent:
     return Intent.unknown
 
 
+def matched_intent_families(user_input: str) -> list[Intent]:
+    """Return every intent family whose keywords appear in the input.
+
+    Used to spot multi-step prompts: when more than one family matches (e.g.
+    "plan my day and add a task"), a single intent isn't enough — the request
+    should go to the agent loop, which can sequence several tools.
+    """
+    text = user_input.lower()
+    return [
+        intent
+        for intent, keywords in _INTENT_KEYWORDS
+        if any(kw in text for kw in keywords)
+    ]
+
+
 def llm_classify_intent(user_input: str, model_name: str) -> Intent:
     """Classify intent with an LLM, falling back to keywords on any failure."""
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        from core.llm_client import create_ollama_model
-        from core.prompts import load_prompt
+        from core.services.llm_client import create_ollama_model
+        from core.services.prompts import load_prompt
 
         llm = create_ollama_model(model_name, temperature=0.0, with_thinking=False)
         response = llm.invoke(
@@ -267,11 +304,118 @@ def make_normalizer(model_name: str, temperature: float, use_llm: bool) -> Norma
     return normalize
 
 
+# -- CRUD wiring: parse the request, then apply it via the MCP write tools -----
+
+#: The task-mcp tool names this app drives for each kind of write.
+MUTATION_TOOL_NAMES = {
+    "create": "create_task",
+    "fields": "update_task_by_id",      # name / description / due_date
+    "status": "update_task_status",
+    "priority": "update_task_priority",
+    "delete": "delete_task_by_id",
+}
+
+#: A function that applies a validated mutation and returns a result message.
+#: Messages beginning with ``"ERROR"`` signal a recoverable failure to the graph.
+MutationExecutor = Callable[[TaskMutation], str]
+
+
+def make_mutation_parser(
+    model_name: str, temperature: float, use_llm: bool
+) -> MutationParser:
+    """Build a mutation parser that prefers the LLM but degrades to heuristics.
+
+    Validation errors are re-raised so TodoAgent can retry the model; only
+    non-recoverable failures (e.g. Ollama unreachable) fall back to the
+    deterministic :func:`heuristic_parse_mutation`.
+    """
+    if not use_llm:
+        return heuristic_parse_mutation
+
+    def parse(user_input: str, current_tasks: list[dict]) -> TaskMutation:
+        try:
+            return llm_parse_mutation(user_input, current_tasks, model_name, temperature)
+        except (ValidationError, ValueError, json.JSONDecodeError):
+            raise  # recoverable — let TodoAgent retry the model
+        except Exception as exc:  # noqa: BLE001 — model down etc.
+            logger.warning("LLM mutation parse failed (%s); using heuristics.", exc)
+            return heuristic_parse_mutation(user_input, current_tasks)
+
+    return parse
+
+
+def make_mutation_executor(tools: list[BaseTool]) -> MutationExecutor:
+    """Build an executor that applies a :class:`TaskMutation` via the MCP tools.
+
+    An ``update`` may touch more than one MCP tool (status, priority, and the
+    name/description/due tool are separate endpoints), so a single confirmed
+    change can issue several calls. Missing tools or a failed call degrade to a
+    recoverable ``"ERROR…"`` message rather than raising into the graph.
+    """
+    by_name = {t.name: t for t in tools}
+
+    def _call(kind: str, args: dict) -> None:
+        tool = by_name.get(MUTATION_TOOL_NAMES[kind])
+        if tool is None:
+            raise LookupError(
+                f"the task server does not expose '{MUTATION_TOOL_NAMES[kind]}'"
+            )
+        _run_coro(tool.ainvoke(args))
+
+    def execute(mutation: TaskMutation) -> str:
+        try:
+            if mutation.op is CrudOp.create:
+                args: dict = {"name": mutation.title}
+                if mutation.description is not None:
+                    args["description"] = mutation.description
+                if mutation.status is not None:
+                    args["status"] = mutation.status.value
+                if mutation.priority is not None:
+                    args["priority"] = mutation.priority.value
+                if mutation.due is not None:
+                    args["due_date"] = mutation.due
+                _call("create", args)
+                return f"Created task '{mutation.title}'."
+
+            if mutation.op is CrudOp.delete:
+                _call("delete", {"task_id": mutation.task_id})
+                return f"Deleted task {mutation.task_id}."
+
+            # update — apply each changed field via its dedicated endpoint.
+            applied: list[str] = []
+            if mutation.priority is not None:
+                _call("priority", {"task_id": mutation.task_id, "priority": mutation.priority.value})
+                applied.append("priority")
+            if mutation.status is not None:
+                _call("status", {"task_id": mutation.task_id, "status": mutation.status.value})
+                applied.append("status")
+            field_args: dict = {"task_id": mutation.task_id}
+            if mutation.title is not None:
+                field_args["name"] = mutation.title
+            if mutation.description is not None:
+                field_args["description"] = mutation.description
+            if mutation.due is not None:
+                field_args["due_date"] = mutation.due
+            if len(field_args) > 1:  # more than just task_id
+                _call("fields", field_args)
+                applied.append("details")
+            return f"Updated task {mutation.task_id} ({', '.join(applied)})."
+
+        except LookupError as exc:
+            logger.warning("Mutation skipped: %s", exc)
+            return f"ERROR: {exc}, so the change was not applied."
+        except Exception as exc:  # noqa: BLE001 — surface a recoverable message
+            logger.warning("Mutation execution failed (%s).", exc)
+            return f"ERROR: the change could not be applied ({exc})."
+
+    return execute
+
+
 def build_orchestrator(
     tools: list[BaseTool],
     model_name: str,
     temperature: float = 0.0,
-    available_minutes: int = DEFAULT_AVAILABLE_MINUTES,
+    workday: Workday | None = None,
     use_llm: bool = True,
 ) -> Orchestrator:
     """Wire a ready-to-run Orchestrator from the live tools and model.
@@ -283,7 +427,7 @@ def build_orchestrator(
         fetch_raw=make_mcp_fetcher(tools),
         normalize=make_normalizer(model_name, temperature, use_llm),
     )
-    planner_agent = DailyPlannerAgent(available_minutes=available_minutes)
+    planner_agent = DailyPlannerAgent(workday=workday or DEFAULT_WORKDAY)
     classifier = (
         (lambda text: llm_classify_intent(text, model_name))
         if use_llm

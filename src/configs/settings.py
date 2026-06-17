@@ -35,3 +35,8 @@ SKILL_SOURCES = os.getenv("SKILL_SOURCES", str(_SRC_DIR / "skills"))
 # pending human-in-the-loop approval can be resumed across restarts. Set
 # ``CHECKPOINT_DB=""`` to disable persistence (falls back to an in-memory saver).
 CHECKPOINT_DB = os.getenv("CHECKPOINT_DB", str(_SRC_DIR.parent / "agent-checkpoints.db"))
+
+# When set (e.g. ``PLANNER_TRACE=1 streamlit run src/app.py``), the multi-agent
+# planner logs each graph node and the state it produces, and the app raises the
+# agent loggers to INFO so the trace appears in the terminal.
+TRACE = bool(os.getenv("PLANNER_TRACE"))

@@ -1,11 +1,29 @@
 from __future__ import annotations
 
+import logging
+
 import streamlit as st
 
 import configs.settings as cfg
 from core.services.skills import load_skills
 from ui.main_view import render_main_view
 from ui.sidebar import render_sidebar
+
+
+def _configure_logging(trace: bool) -> None:
+    """Send the agent loggers to the terminal — verbose (INFO) when tracing.
+
+    Targets the ``agents`` logger only (so the planner's ``[trace]`` steps show)
+    and stops propagation, keeping third-party libraries out of the output.
+    Idempotent across Streamlit reruns.
+    """
+    agents_logger = logging.getLogger("agents")
+    agents_logger.setLevel(logging.INFO if trace else logging.WARNING)
+    agents_logger.propagate = False
+    if not any(isinstance(h, logging.StreamHandler) for h in agents_logger.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        agents_logger.addHandler(handler)
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +49,8 @@ def _load_tools(servers_frozen: tuple[tuple[str, str], ...]):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    _configure_logging(cfg.TRACE)
+
     st.set_page_config(
         page_title="Task Agent",
         page_icon="📋",

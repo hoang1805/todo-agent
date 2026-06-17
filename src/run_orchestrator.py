@@ -10,6 +10,7 @@ Examples::
     python src/run_orchestrator.py "plan my day"
     python src/run_orchestrator.py "what's on my list?"
     python src/run_orchestrator.py "plan my day" --day-end 12:00   # overloaded
+    python src/run_orchestrator.py "plan my day" --trace           # print every step
 """
 
 from __future__ import annotations
@@ -37,7 +38,28 @@ def main() -> None:
         help="Workday end (HH:MM). Shorten it (e.g. 12:00) to force an overload.",
     )
     parser.add_argument("--verbose", action="store_true", help="Show agent logs.")
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Run through the LangGraph orchestrator and print every node + state step.",
+    )
     args = parser.parse_args()
+
+    workday = Workday(start=args.day_start, end=args.day_end)
+
+    # --trace: run the graph orchestrator with the step observer on, so each node
+    # and the state it produces is printed as the request flows through the graph.
+    if args.trace:
+        from agents.graph_orchestrator import build_graph_orchestrator
+
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        go = build_graph_orchestrator(
+            tools=[], model_name="dummy", workday=workday, use_llm=False, observe=True,
+        )
+        print(f"=== Tracing: {args.prompt!r} ===\n")
+        result = go.run(args.prompt)
+        print("\n=== RESULT ===\n" + result)
+        return
 
     if args.verbose:
         logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
@@ -48,7 +70,6 @@ def main() -> None:
         fetch_raw=sample_raw_tasks,
         normalize=heuristic_normalize,
     )
-    workday = Workday(start=args.day_start, end=args.day_end)
     planner_agent = DailyPlannerAgent(workday=workday)
     orchestrator = Orchestrator(todo_agent, planner_agent)
 

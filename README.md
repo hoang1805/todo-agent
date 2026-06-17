@@ -78,6 +78,8 @@ Orchestrator → formatted, time-blocked day
   approval** (LangGraph `interrupt`), the change is applied via the MCP write tools, and the day is
   **re-planned** so you see the effect. Reads stay autonomous. (The generic agent⇄tools loop also
   gates its mutating tools, via [`agents/human_in_the_loop.py`](src/agents/human_in_the_loop.py).)
+  Create/update can set any task field — title, description, priority, status,
+  **estimated minutes**, **category** (work/home/health/…), and due date.
 - **Approvals survive restarts.** The graph is compiled with a **persistent SQLite checkpointer**
   ([`core/services/checkpoint.py`](src/core/services/checkpoint.py)), so a pending approval — and the
   conversation thread — can be resumed even after the process restarts. It falls back to an in-memory
@@ -93,10 +95,12 @@ Orchestrator → formatted, time-blocked day
   call, a `ToolNode` runs it, and a **conditional edge** (`should_continue`) routes back to the agent
   while tool calls remain. The loop's memory is the message list in state, bounded by `recursion_limit`.
   The deterministic capabilities are themselves exposed as tools (`plan_my_day`, `summarize_tasks`)
-  alongside **all** the local helper tools and the MCP CRUD tools, so a request like *"add a task, then
-  re-plan my day, then show my list"* is sequenced by the loop, one tool per iteration. A prompt that
-  matches more than one intent family is routed here automatically; single `plan`/`summary` requests stay
-  on the loop-free deterministic path.
+  alongside **all** the local helper tools (date, **weather**) and the MCP CRUD tools, so a request that
+  bundles several intents — *"create a task to call the bank, delete the gym task, re-plan my day, and
+  what's the weather in Hanoi?"* — is parsed into a checklist and sequenced by the loop, one tool per
+  iteration ([`prompts/complex_agent_system.md`](src/prompts/complex_agent_system.md) tells it to handle
+  every part). A prompt that matches more than one intent family (or a non-task one like weather) is
+  routed here automatically; single `plan`/`summary`/CRUD requests stay on the loop-free deterministic path.
 - **The agent knows its tools.** The loop's system prompt is built from the live tool set (name +
   one-line description for every bound tool), so the model is told exactly what it can call.
 - **Graceful degradation.** With the MCP server down it uses sample tasks; with Ollama down it uses
@@ -120,6 +124,24 @@ python src/run_orchestrator.py "what's on my list?"
 
 ```bash
 pytest tests/ -q
+```
+
+**Visualize / observe the graph** (offline; writes `planner_graph.mmd` + `.png`):
+
+```bash
+python src/visualize_graph.py                  # draw the graph (Mermaid + PNG)
+python src/visualize_graph.py "plan my day"    # also trace each node + state delta
+```
+
+The step observer is also available in any run by passing `observe=True` to
+`build_graph_orchestrator(...)` or setting `PLANNER_TRACE=1` — each node logs
+`[trace] ▶ <node>` and `[trace] ✓ <node> → <state delta>`.
+
+To trace the **Streamlit app** in the Planner mode, launch it with the flag set —
+the steps print in the terminal running Streamlit:
+
+```bash
+PLANNER_TRACE=1 streamlit run src/app.py     # or: python src/run_orchestrator.py "plan my day" --trace
 ```
 
 ## Project layout
@@ -151,7 +173,7 @@ src/
 │   │   ├── prompts.py      #   Loads prompts from src/prompts/
 │   │   └── skills.py       #   Skill loading + roster formatting
 │   └── tools/              # LangChain tool factories
-│       ├── common_tools.py #   Always-available native @tool helpers (get_today_date, …)
+│       ├── common_tools.py #   Always-available native @tool helpers (date, weather, …)
 │       └── skill_tools.py  #   get_skill_detail — the on-demand skill loader tool
 ├── prompts/
 │   ├── agent_system.md            # Skill-agent system prompt ({skills_roster} slot)

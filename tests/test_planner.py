@@ -113,3 +113,27 @@ def test_empty_tasklist_produces_empty_plan():
     plan = plan_day(TaskList(tasks=[]), workday=NO_BREAKS)
     assert plan.blocks == []
     assert plan.overloaded is False
+
+
+def test_meal_task_claims_the_matching_break():
+    tasks = TaskList(tasks=[
+        Task(id="1", title="Review PR", priority="high", est_minutes=60, category="work"),
+        Task(id="2", title="Having a dinner with CEO", priority="medium", est_minutes=45, category="personal"),
+    ])
+    # Default workday has a Dinner break at 18:00–19:00.
+    plan = plan_day(tasks)
+
+    dinner = next(b for b in plan.breaks if b.start == "18:00")
+    assert "dinner with ceo" in dinner.name.lower()            # break shows the task
+    assert all(t.title != tasks.tasks[1].title for t in plan.deferred)  # never deferred
+    assert all(b.title != tasks.tasks[1].title for b in plan.blocks)    # not a work block
+
+
+def test_meal_task_is_ordinary_without_a_matching_break():
+    tasks = TaskList(tasks=[
+        Task(id="1", title="Having a dinner with CEO", priority="high", est_minutes=45, category="personal"),
+    ])
+    # No Dinner break in this window -> it's just a normal task.
+    plan = plan_day(tasks, workday=Workday(start="09:00", end="18:00", breaks=()))
+    assert plan.breaks == []
+    assert [b.title for b in plan.blocks] == ["Having a dinner with CEO"]

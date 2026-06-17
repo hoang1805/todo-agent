@@ -53,12 +53,14 @@ day so the user sees the effect.
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
 import uuid
 from dataclasses import dataclass
 from typing import Annotated, Any, NotRequired, TYPE_CHECKING, TypedDict
 
-from langchain_core.messages import AnyMessage, HumanMessage  # noqa: TC002 — runtime use
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage  # noqa: TC002 — runtime use
 from langchain_core.tools import StructuredTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -117,6 +119,36 @@ _MUTATION_PARSE_ERROR_MSG = (
 _REJECTED_MSG = "Okay — I left your tasks unchanged."
 
 
+def _summarize_delta(delta: dict) -> str:
+    """Render a node's state update compactly for the step observer."""
+    parts = []
+    for key, value in (delta or {}).items():
+        if key == "messages":
+            msgs = value if isinstance(value, list) else [value]
+            parts.append(f"messages+={len(msgs)}")
+        elif isinstance(value, str):
+            flat = value.replace("\n", " ")
+            parts.append(f"{key}={flat[:60]!r}" + ("…" if len(flat) > 60 else ""))
+        elif isinstance(value, dict):
+            parts.append(f"{key}={{{', '.join(value.keys())}}}")
+        else:
+            parts.append(f"{key}={value!r}")
+    return ", ".join(parts) if parts else "(no state change)"
+
+
+def _trace_node(name: str, fn):
+    """Wrap a node so each step logs which node ran and the state it produced."""
+
+    @functools.wraps(fn)
+    def wrapped(state):
+        logger.info("[trace] ▶ %s", name)
+        result = fn(state)
+        logger.info("[trace] ✓ %s → %s", name, _summarize_delta(result))
+        return result
+
+    return wrapped
+
+
 def _describe_mutation(mutation: TaskMutation) -> str:
     """A one-line, human-readable summary of a proposed change (for approval)."""
     if mutation.op is CrudOp.create:
@@ -136,7 +168,9 @@ class PlannerState(TypedDict):
     user_input: str
     date: NotRequired[str | None]
     intent: NotRequired[str]
-    tasks: NotRequired[TaskList | None]
+    # The validated task list as a JSON-native dict (so the checkpointer stores
+    # only plain types, not TaskList/Priority). Reconstructed via TaskList on use.
+    tasks: NotRequired[dict | None]
     # The validated CRUD change as a JSON-native dict (so the checkpointer stores
     # only plain types, not custom classes). Reconstructed via TaskMutation when used.
     mutation: NotRequired[dict | None]
@@ -171,6 +205,7 @@ def build_graph_orchestrator(
     checkpointer_db: str | None = None,
     mutation_parser: MutationParser | None = None,
     mutation_executor: MutationExecutor | None = None,
+    observe: bool = False,
 ):
     """Wire and compile the LangGraph orchestrator.
 
@@ -257,6 +292,8 @@ def build_graph_orchestrator(
     # -- nodes --------------------------------------------------------------
 
     def classify(state: PlannerState) -> dict:
+        # Echo the user's prompt before any reasoning (for logs/observability).
+        logger.info("USER PROMPT: %s", state["user_input"])
         # A prompt that touches more than one intent family (e.g. "plan my day
         # AND add a task") is multi-step — send it to the agent loop, which can
         # sequence several tools, instead of a single deterministic path.
@@ -266,17 +303,19 @@ def build_graph_orchestrator(
 
     def run_todo(state: PlannerState) -> dict:
         try:
-            return {"tasks": todo_agent.run()}
+            # Store as a JSON-native dict so the checkpointer persists plain types
+            # (not TaskList/Priority, which trip the serde's unregistered-type warning).
+            return {"tasks": todo_agent.run().model_dump(mode="json")}
         except ContractError as exc:
             logger.error("Contract failed: %s", exc.errors)
             return {"error": _CONTRACT_ERROR_MSG}
 
     def run_planner(state: PlannerState) -> dict:
-        plan = planner_agent.run(state["tasks"], date=state.get("date"))
+        plan = planner_agent.run(TaskList.model_validate(state["tasks"]), date=state.get("date"))
         return {"result": format_plan(plan)}
 
     def run_summary(state: PlannerState) -> dict:
-        return {"result": format_summary(state["tasks"])}
+        return {"result": format_summary(TaskList.model_validate(state["tasks"]))}
 
     # -- CRUD path: validate (contract checkpoint) → confirm → execute → replan --
 
@@ -345,15 +384,32 @@ def build_graph_orchestrator(
 
     def finalize(state: PlannerState) -> dict:
         notice = state.get("notice")
+        msgs = state.get("messages") or []
+
         if state.get("result"):
             # A successful CRUD change prepends its confirmation to the re-plan.
-            return {"result": f"{notice}\n\n{state['result']}"} if notice else {}
-        if state.get("error"):
-            return {"result": f"{notice}\n\n{state['error']}" if notice else state["error"]}
-        if state.get("intent") in (None, "unknown") and not state.get("messages"):
-            return {"result": _UNKNOWN_MSG}
-        last = state["messages"][-1] if state.get("messages") else None
-        return {"result": (getattr(last, "content", "") or _UNKNOWN_MSG)}
+            final = f"{notice}\n\n{state['result']}" if notice else state["result"]
+        elif state.get("error"):
+            final = f"{notice}\n\n{state['error']}" if notice else state["error"]
+        elif state.get("intent") in (None, "unknown") and not msgs:
+            final = _UNKNOWN_MSG
+        else:
+            last = msgs[-1] if msgs else None
+            final = getattr(last, "content", "") or _UNKNOWN_MSG
+
+        out: dict = {"result": final}
+        # Record the assistant's reply in the conversation log so the next turn
+        # remembers it (memory). The agent loop already leaves its final answer as
+        # the last message, so only append for the deterministic paths.
+        last = msgs[-1] if msgs else None
+        loop_already_logged = (
+            isinstance(last, AIMessage)
+            and not getattr(last, "tool_calls", None)
+            and (last.content or "") == final
+        )
+        if final and not loop_already_logged:
+            out["messages"] = [AIMessage(content=final)]
+        return out
 
     # -- edges (incl. the CRUD path and the loop) --------------------------
 
@@ -386,17 +442,22 @@ def build_graph_orchestrator(
         last = state["messages"][-1]
         return "tools" if getattr(last, "tool_calls", None) else "finalize"
 
+    # Observer: when on (param or PLANNER_TRACE env), each node logs the step it
+    # ran and the state it produced — so you can watch the agents work.
+    observe = observe or bool(os.getenv("PLANNER_TRACE"))
+    node = (lambda name, fn: _trace_node(name, fn)) if observe else (lambda name, fn: fn)
+
     g = StateGraph(PlannerState)
-    g.add_node("classify", classify)
-    g.add_node("todo", run_todo)
-    g.add_node("planner", run_planner)
-    g.add_node("summary", run_summary)
-    g.add_node("extract_mutation", extract_mutation)
-    g.add_node("confirm_mutation", confirm_mutation)
-    g.add_node("execute_mutation", execute_mutation)
-    g.add_node("agent", agent)
+    g.add_node("classify", node("classify", classify))
+    g.add_node("todo", node("todo", run_todo))
+    g.add_node("planner", node("planner", run_planner))
+    g.add_node("summary", node("summary", run_summary))
+    g.add_node("extract_mutation", node("extract_mutation", extract_mutation))
+    g.add_node("confirm_mutation", node("confirm_mutation", confirm_mutation))
+    g.add_node("execute_mutation", node("execute_mutation", execute_mutation))
+    g.add_node("agent", node("agent", agent))
     g.add_node("tools", ToolNode(agent_tools))
-    g.add_node("finalize", finalize)
+    g.add_node("finalize", node("finalize", finalize))
 
     g.add_edge(START, "classify")
     g.add_conditional_edges(
@@ -461,6 +522,44 @@ class GraphOrchestrator:
         self._graph_def = graph_def
         self._open_checkpointer = open_checkpointer
 
+    # -- visualization ------------------------------------------------------
+
+    def _drawable(self):
+        """A compiled graph for drawing only (no checkpointer needed)."""
+        return self._graph_def.compile()
+
+    def draw_mermaid(self) -> str:
+        """Return the graph as Mermaid text (paste into https://mermaid.live)."""
+        return self._drawable().get_graph().draw_mermaid()
+
+    def draw_ascii(self) -> str:
+        """Return an ASCII rendering of the graph (needs the ``grandalf`` extra)."""
+        return self._drawable().get_graph().draw_ascii()
+
+    def save_visualization(self, path: str = "planner_graph") -> dict:
+        """Write the graph to ``<path>.mmd`` and try ``<path>.png`` (best effort).
+
+        Returns the paths actually written, e.g. ``{"mermaid": "...", "png": "..."}``.
+        """
+        from pathlib import Path
+
+        graph = self._drawable().get_graph()
+        written: dict[str, str] = {}
+
+        mmd_path = Path(f"{path}.mmd")
+        mmd_path.write_text(graph.draw_mermaid(), encoding="utf-8")
+        written["mermaid"] = str(mmd_path)
+
+        try:  # PNG needs mermaid.ink (network) or a local renderer — optional.
+            png = graph.draw_mermaid_png()
+            png_path = Path(f"{path}.png")
+            png_path.write_bytes(png)
+            written["png"] = str(png_path)
+        except Exception as exc:  # noqa: BLE001 — PNG is a nice-to-have
+            logger.info("PNG render skipped (%s); the .mmd file is available.", exc)
+
+        return written
+
     def _config(self, thread_id: str) -> dict:
         return {
             "configurable": {"thread_id": thread_id},
@@ -482,7 +581,18 @@ class GraphOrchestrator:
                 {
                     "user_input": user_input,
                     "date": date,
+                    # `messages` is append-only — the conversation memory we keep.
                     "messages": [HumanMessage(content=user_input)],
+                    # Everything else is per-turn scratch: reset it so a new turn
+                    # never re-emits the previous turn's plan/result/notice (the
+                    # checkpointer would otherwise carry them over on the thread).
+                    "intent": "",
+                    "tasks": None,
+                    "mutation": None,
+                    "approved": False,
+                    "notice": "",
+                    "result": "",
+                    "error": "",
                 },
                 thread_id,
             )

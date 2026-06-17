@@ -90,3 +90,35 @@ def test_normalizer_falls_back_to_heuristic_when_model_unreachable():
     result = normalize(sample_raw_tasks())
     assert isinstance(result, TaskList)
     assert len(result.tasks) == len(sample_raw_tasks())
+
+
+# -- get_weather tool (network stubbed) --------------------------------------
+
+
+import core.tools.common_tools as common_tools
+
+
+def test_get_weather_formats_a_reading(monkeypatch):
+    def fake_http_json(url, timeout=6.0):
+        if "geocoding" in url:
+            return {"results": [{"latitude": 21.0, "longitude": 105.8,
+                                 "name": "Hanoi", "country": "Vietnam"}]}
+        return {
+            "current": {"temperature_2m": 31, "apparent_temperature": 35,
+                        "weather_code": 2, "wind_speed_10m": 10},
+            "current_units": {"temperature_2m": "°C", "wind_speed_10m": "km/h"},
+        }
+
+    monkeypatch.setattr(common_tools, "_http_json", fake_http_json)
+    out = common_tools.get_weather.invoke({"location": "Hanoi"})
+    assert "Hanoi" in out and "partly cloudy" in out and "31" in out
+
+
+def test_get_weather_handles_unknown_place(monkeypatch):
+    monkeypatch.setattr(common_tools, "_http_json", lambda url, timeout=6.0: {"results": []})
+    out = common_tools.get_weather.invoke({"location": "Nowhereville"})
+    assert "couldn't find" in out.lower()
+
+
+def test_get_weather_requires_a_location():
+    assert "which place" in common_tools.get_weather.invoke({"location": "   "}).lower()

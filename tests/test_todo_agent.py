@@ -73,10 +73,12 @@ def test_todo_agent_raises_recoverable_error_after_exhausting_retries():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        dict(op=CrudOp.create),                       # create needs a title
-        dict(op=CrudOp.update, task_id="1"),          # update needs ≥1 field
-        dict(op=CrudOp.update, status=Status.done),   # update needs a task_id
-        dict(op=CrudOp.delete),                       # delete needs a task_id
+        dict(op=CrudOp.create),                                  # create needs a title
+        dict(op=CrudOp.update, task_id="1"),                     # update needs ≥1 field
+        dict(op=CrudOp.update, status=Status.done),              # update needs a task_id
+        dict(op=CrudOp.delete),                                  # delete needs a task_id
+        dict(op=CrudOp.create, title="x", est_minutes=0),        # est must be > 0
+        dict(op=CrudOp.create, title="x", est_minutes=9000),     # est must be ≤ 480
     ],
 )
 def test_task_mutation_rejects_underspecified_changes(kwargs):
@@ -90,6 +92,13 @@ def test_task_mutation_accepts_well_formed_changes():
         "status": Status.done
     }
     assert TaskMutation(op=CrudOp.delete, task_id="9").task_id == "9"
+    # est_minutes and category are settable fields and count as a change.
+    assert TaskMutation(op=CrudOp.update, task_id="1", est_minutes=30).changed_fields == {
+        "est_minutes": 30
+    }
+    assert TaskMutation(op=CrudOp.update, task_id="1", category="home").changed_fields == {
+        "category": "home"
+    }
 
 
 # -- CRUD: the heuristic parser + TodoAgent.parse_mutation -------------------
@@ -110,6 +119,24 @@ def test_heuristic_parse_delete_and_update_resolve_task_id():
 
     done = heuristic_parse_mutation("mark Finish Q3 report as done", _CURRENT)
     assert done.op is CrudOp.update and done.task_id == "7" and done.status is Status.done
+
+
+def test_llm_parse_mutation_tolerates_fenced_json_array(monkeypatch):
+    # Reproduces the reported failure: the model wrapped a single change in a
+    # ```json fence as an array. The parser must still recover it.
+    import core.services.llm_client as llm_client
+    from langchain_core.messages import AIMessage
+    from agents.todo_agent import llm_parse_mutation
+
+    fenced = '```json\n[\n  {\n    "op": "delete",\n    "task_id": "P003"\n  }\n]\n```'
+
+    class _Fake:
+        def invoke(self, _messages):
+            return AIMessage(content=fenced)
+
+    monkeypatch.setattr(llm_client, "create_ollama_model", lambda *a, **k: _Fake())
+    mutation = llm_parse_mutation("cancel the dentist task", [], "dummy", 0.0)
+    assert mutation.op is CrudOp.delete and mutation.task_id == "P003"
 
 
 def test_parse_mutation_raises_recoverable_error_when_unresolved():

@@ -90,6 +90,31 @@ def rank_tasks(tasks: list[Task]) -> list[Task]:
     )
 
 
+def _claim_meal_breaks(tasks: list[Task], breaks: list[Break]) -> tuple[dict, set]:
+    """Match meal-named tasks to meal breaks.
+
+    A task whose title contains a break's name (e.g. "Dinner with CEO" → the
+    ``Dinner`` break) *claims* that break: it occupies the slot and is never
+    deferred, replacing the generic placeholder. Each break is claimed by at most
+    one task and each task claims at most one break.
+
+    Returns ``(claims, claimed_ids)`` where ``claims`` maps a :class:`Break` to
+    its claiming :class:`Task` and ``claimed_ids`` is the set of claimed task ids.
+    """
+    claims: dict[Break, Task] = {}
+    claimed_ids: set = set()
+    for brk in breaks:
+        keyword = brk.name.lower()
+        for task in tasks:
+            if task.id in claimed_ids:
+                continue
+            if keyword in task.title.lower():
+                claims[brk] = task
+                claimed_ids.add(task.id)
+                break
+    return claims, claimed_ids
+
+
 # ---------------------------------------------------------------------------
 # The decision
 # ---------------------------------------------------------------------------
@@ -109,23 +134,35 @@ def plan_day(
     work). The cursor only advances on a successful placement, so a single big
     task that doesn't fit doesn't block smaller tasks that still could.
 
+    A task that *is* a meal (its title matches a break's name, e.g. "dinner with
+    CEO") claims that break: it fills the slot and is never deferred, replacing
+    the generic label. Other tasks schedule around every break's time as usual.
+
     Returns a :class:`DayPlan`; ``plan.overloaded`` is ``True`` iff anything was
     deferred. Meal breaks within the window are returned in ``plan.breaks``.
     """
     start, end = _t(workday.start), _t(workday.end)
     ordered_breaks = sorted(workday.breaks, key=lambda b: _t(b.start))
+    breaks_in_window = [b for b in ordered_breaks if _t(b.end) > start and _t(b.start) < end]
+
+    # A meal task claims its matching break (occupies the slot, never deferred).
+    claims, claimed_ids = _claim_meal_breaks(tasks.tasks, breaks_in_window)
 
     meal_blocks = [
-        MealBreak(name=b.name, start=b.start, end=b.end)
-        for b in ordered_breaks
-        if _t(b.end) > start and _t(b.start) < end
+        MealBreak(
+            name=claims[b].title if b in claims else b.name,
+            start=b.start,
+            end=b.end,
+        )
+        for b in breaks_in_window
     ]
 
     cursor = start
     blocks: list[TimeBlock] = []
     deferred: list[Task] = []
 
-    for task in rank_tasks(tasks.tasks):
+    # Claimed meal tasks are placed in their break slot; schedule the rest.
+    for task in rank_tasks([t for t in tasks.tasks if t.id not in claimed_ids]):
         place = cursor
         # Skip the placement cursor past any break this task would overlap.
         while True:

@@ -31,6 +31,32 @@ from models.contract import CrudOp, Priority, Status, Task, TaskList, TaskMutati
 
 logger = logging.getLogger(__name__)
 
+
+def _loads_jsonish(text: str):
+    """Parse JSON from a model response, tolerating ```code fences``` and prose.
+
+    Local models sometimes ignore structured-output constraints and wrap JSON in
+    a markdown fence or add chatter. This strips a leading/trailing fence and, if
+    needed, falls back to the outermost ``{...}``/``[...]`` block. Returns the
+    decoded object (dict or list); raises ``json.JSONDecodeError`` if none found.
+    """
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        newline = cleaned.find("\n")
+        cleaned = cleaned[newline + 1:] if newline != -1 else cleaned[3:]
+        fence = cleaned.rfind("```")
+        if fence != -1:
+            cleaned = cleaned[:fence]
+        cleaned = cleaned.strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        starts = [i for i in (cleaned.find("{"), cleaned.find("[")) if i != -1]
+        ends = [i for i in (cleaned.rfind("}"), cleaned.rfind("]")) if i != -1]
+        if starts and ends and max(ends) > min(starts):
+            return json.loads(cleaned[min(starts):max(ends) + 1])
+        raise
+
 #: A function that returns the raw task records from the store.
 RawFetcher = Callable[[], list[dict]]
 #: A function that turns raw records into a validated, normalized TaskList.
@@ -130,7 +156,10 @@ def llm_normalize(
         ]
     )
     # Validate on the way IN. If this raises, run() retries the step.
-    return TaskList.model_validate_json(response.content)
+    data = _loads_jsonish(response.content)
+    if isinstance(data, list):  # model returned a bare task array
+        data = {"tasks": data}
+    return TaskList.model_validate(data)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +256,12 @@ def llm_parse_mutation(
         ]
     )
     # Validate on the way IN. If this raises, parse_mutation() retries the step.
-    return TaskMutation.model_validate_json(response.content)
+    data = _loads_jsonish(response.content)
+    if isinstance(data, list):  # model wrapped a single change in an array
+        if not data:
+            raise ValueError("the model returned no task change")
+        data = data[0]
+    return TaskMutation.model_validate(data)
 
 
 # ---------------------------------------------------------------------------

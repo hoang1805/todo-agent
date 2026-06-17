@@ -124,10 +124,21 @@ def _get_planner(tools: list[BaseTool], model: str, temperature: float):
     key = (model, round(temperature, 3), len(tools))
     if st.session_state.get("planner_key") != key:
         st.session_state.planner = build_graph_orchestrator(
-            tools, model, temperature, checkpointer_db=cfg.CHECKPOINT_DB or None
+            tools, model, temperature,
+            checkpointer_db=cfg.CHECKPOINT_DB or None,
+            observe=cfg.TRACE,  # log each node + state to the terminal when tracing
         )
         st.session_state.planner_key = key
     return st.session_state.planner
+
+
+def _as_markdown(text: str) -> str:
+    """Render preformatted text as Markdown without a code fence.
+
+    Single newlines become hard line breaks (``  \\n``) so the plan keeps one
+    item per line, while bold/emoji/etc. still render as Markdown.
+    """
+    return (text or "").replace("\n", "  \n")
 
 
 def _consume_planner_result(result) -> None:
@@ -135,7 +146,7 @@ def _consume_planner_result(result) -> None:
     if result.status == "done":
         st.session_state.planner_pending = None
         st.session_state.messages.append(
-            {"role": "ai", "content": f"```text\n{result.text}\n```"}
+            {"role": "ai", "content": _as_markdown(result.text)}
         )
         return
 
@@ -156,10 +167,19 @@ def _consume_planner_result(result) -> None:
 
 
 def _start_planner_turn(planner, prompt: str) -> None:
-    """Start a planner run for *prompt* (may pause for approval)."""
+    """Start a planner run for *prompt* (may pause for approval).
+
+    Uses the session's stable ``thread_id`` so the planner remembers the
+    conversation across turns (the checkpointer keys state by thread_id) — a new
+    id per turn would wipe its memory.
+    """
     from core.tools.common_tools import get_today_date
 
-    result = planner.start(prompt, date=get_today_date.invoke({}))
+    result = planner.start(
+        prompt,
+        date=get_today_date.invoke({}),
+        thread_id=st.session_state.thread_id,
+    )
     _consume_planner_result(result)
 
 

@@ -59,6 +59,7 @@ class Intent(str, Enum):
     add = "add"
     update = "update"
     delete = "delete"
+    weather = "weather"
     unknown = "unknown"
 
 
@@ -83,12 +84,16 @@ _INTENT_KEYWORDS: list[tuple[Intent, tuple[str, ...]]] = [
     (Intent.delete, ("delete ", "remove ", "cancel the", "cancel task")),
     (Intent.update, ("mark ", "complete ", "finish ", "rename ", "reschedule ",
                       "update task", "set priority", "set status",
-                      "change priority", "change status", "as done", "is done")),
+                      "change priority", "change status", "as done", "is done",
+                      "estimate", "duration", "categor", "move to",
+                      "change the time", "set the time")),
     (Intent.add, ("add ", "create ", "new task", "remind me to", "schedule a")),
     (Intent.plan, ("plan", "time block", "time-block", "organize my day",
                    "schedule my day", "what should i do")),
     (Intent.summary, ("summary", "summarize", "what's on", "whats on",
                       "list", "show me", "what do i have", "overview")),
+    (Intent.weather, ("weather", "forecast", "temperature", "how hot",
+                      "how cold", "is it raining", "will it rain")),
 ]
 
 
@@ -360,7 +365,17 @@ def make_mutation_executor(tools: list[BaseTool]) -> MutationExecutor:
             raise LookupError(
                 f"the task server does not expose '{MUTATION_TOOL_NAMES[kind]}'"
             )
-        _run_coro(tool.ainvoke(args))
+        result = _run_coro(tool.ainvoke(args))
+        # The MCP server returns a structured recoverable error on failure; treat
+        # ``{"ok": false, "error": ...}`` (dict or JSON string) as a failed call.
+        payload = result
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (ValueError, TypeError):
+                payload = result
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            raise RuntimeError(payload.get("error", "the task server rejected the change"))
 
     def execute(mutation: TaskMutation) -> str:
         try:
@@ -372,6 +387,10 @@ def make_mutation_executor(tools: list[BaseTool]) -> MutationExecutor:
                     args["status"] = mutation.status.value
                 if mutation.priority is not None:
                     args["priority"] = mutation.priority.value
+                if mutation.est_minutes is not None:
+                    args["est_minutes"] = mutation.est_minutes
+                if mutation.category is not None:
+                    args["category"] = mutation.category
                 if mutation.due is not None:
                     args["due_date"] = mutation.due
                 _call("create", args)
@@ -394,6 +413,10 @@ def make_mutation_executor(tools: list[BaseTool]) -> MutationExecutor:
                 field_args["name"] = mutation.title
             if mutation.description is not None:
                 field_args["description"] = mutation.description
+            if mutation.est_minutes is not None:
+                field_args["est_minutes"] = mutation.est_minutes
+            if mutation.category is not None:
+                field_args["category"] = mutation.category
             if mutation.due is not None:
                 field_args["due_date"] = mutation.due
             if len(field_args) > 1:  # more than just task_id

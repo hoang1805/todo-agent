@@ -12,7 +12,9 @@ Fields:
   return your best guess of `op` but leave `task_id` empty — it is better to
   fail validation than to change the wrong task.
 - `title`, `description`, `priority` (`low`/`medium`/`high`),
-  `status` (`pending`/`in_progress`/`done`), `due` (a `YYYY-MM-DD` date):
+  `status` (`pending`/`in_progress`/`done`), `est_minutes` (integer 1–480,
+  the estimated effort), `category` (a lowercase group like `work`/`home`/
+  `health`/`errand`/`personal`), `due` (a `YYYY-MM-DD` date):
   set only the fields the request actually specifies. Leave the rest unset.
 
 Rules:
@@ -20,6 +22,8 @@ Rules:
 - `create`: set `title` (and any other fields mentioned). Do **not** set `task_id`.
 - `update`: set `task_id` plus only the fields that change. "mark X as done" /
   "finish X" → `status: done`. "make X high priority" → `priority: high`.
+  "give X 30 minutes" / "set X to 2 hours" → `est_minutes` (in minutes).
+  "move X to home" / "categorize X as work" → `category`.
 - `delete`: set `task_id` only.
 
 Examples:

@@ -160,7 +160,7 @@ class CrudOp(str, Enum):
 
 
 #: Fields a mutation may set on a task (everything except ``op``/``task_id``).
-_MUTATION_FIELDS = ("title", "description", "priority", "status", "due")
+_MUTATION_FIELDS = ("title", "description", "priority", "status", "est_minutes", "category", "due")
 
 
 class TaskMutation(BaseModel):
@@ -183,9 +183,11 @@ class TaskMutation(BaseModel):
     description: str | None = None
     priority: Priority | None = None
     status: Status | None = None
+    est_minutes: int | None = Field(default=None, gt=0, le=480)
+    category: str | None = None
     due: str | None = None  # ISO date string (YYYY-MM-DD), optional
 
-    @field_validator("title", "description", "task_id", "due", mode="before")
+    @field_validator("title", "description", "task_id", "category", "due", mode="before")
     @classmethod
     def _strip(cls, value: object) -> object:
         # Normalize blank strings to None so they don't masquerade as set fields.

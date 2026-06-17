@@ -232,6 +232,53 @@ def test_crud_invalid_request_is_surfaced_recoverably():
     assert "rephrase" in out.lower()
 
 
+class _RecordingLLM:
+    """Fake chat model that records the messages it is invoked with."""
+
+    def __init__(self):
+        self.seen = []  # one list of message-contents per invoke
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, messages):
+        self.seen.append([getattr(m, "content", "") for m in messages])
+        return AIMessage(content="ok")
+
+
+def test_planner_remembers_conversation_across_turns(monkeypatch):
+    rec = _RecordingLLM()
+    monkeypatch.setattr(llm_client, "create_ollama_model", lambda *a, **k: rec)
+
+    go = build_graph_orchestrator(tools=[], model_name="dummy", use_llm=True)
+    # Two turns on the SAME thread_id -> the second must see the first turn.
+    go.start("remember apples", thread_id="mem-1")
+    go.start("what did I say", thread_id="mem-1")
+
+    second_turn = rec.seen[1]
+    assert "remember apples" in second_turn  # prior user message retained
+    assert "ok" in second_turn               # prior assistant reply retained
+
+
+def test_new_turn_does_not_re_emit_previous_turns_result():
+    # Regression: with a stable thread, per-turn scratch (result/notice) must be
+    # reset so a later turn never repeats the previous turn's confirmation/plan.
+    calls = []
+    mutation = TaskMutation(op=CrudOp.create, title="Call the bank")
+    go = _crud_orchestrator(calls=calls, mutation=mutation, result="Created task 'Call the bank'.")
+
+    pending = go.start("add a task to call the bank", thread_id="turns")
+    done1 = go.resume(pending.thread_id, {"action": "accept"})
+    assert "✅ Created task 'Call the bank'." in done1.text   # turn 1 confirms
+
+    # Turn 2 on the SAME thread: a summary request must not carry the turn-1 notice.
+    done2 = go.start("what's on my list?", thread_id="turns")
+    assert done2.status == "done"
+    assert "✅" not in done2.text                              # no stale notice
+    assert "Created task 'Call the bank'." not in done2.text   # no stale result
+    assert "task(s)" in done2.text                             # fresh summary
+
+
 def test_crud_state_persists_across_orchestrator_instances(tmp_path):
     db = str(tmp_path / "ckpt.db")
     mutation = TaskMutation(op=CrudOp.create, title="Persisted task")
@@ -247,3 +294,29 @@ def test_crud_state_persists_across_orchestrator_instances(tmp_path):
     assert done.status == "done"
     assert len(calls2) == 1                         # resumed from disk and executed
     assert "Your plan" in done.text
+
+
+# -- visualization + observer ------------------------------------------------
+
+
+def test_draw_mermaid_includes_the_nodes():
+    go = build_graph_orchestrator(tools=[], model_name="dummy", use_llm=False)
+    mermaid = go.draw_mermaid()
+    for node in ("classify", "todo", "planner", "extract_mutation", "finalize"):
+        assert node in mermaid
+
+
+def test_observer_logs_steps_without_breaking_the_run(caplog):
+    import logging
+
+    tight = Workday(start="09:00", end="11:00", breaks=())
+    go = build_graph_orchestrator(
+        tools=[], model_name="dummy", use_llm=False, workday=tight, observe=True
+    )
+    with caplog.at_level(logging.INFO, logger="agents.graph_orchestrator"):
+        out = go.run("plan my day", date="2026-06-16")
+
+    assert "Your plan" in out                                  # run still works
+    traced = [r.message for r in caplog.records if "[trace]" in r.message]
+    assert any("classify" in m for m in traced)                # steps were observed
+    assert any("planner" in m for m in traced)

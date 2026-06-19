@@ -255,9 +255,11 @@ def test_planner_remembers_conversation_across_turns(monkeypatch):
     go.start("remember apples", thread_id="mem-1")
     go.start("what did I say", thread_id="mem-1")
 
-    second_turn = rec.seen[1]
-    assert "remember apples" in second_turn  # prior user message retained
-    assert "ok" in second_turn               # prior assistant reply retained
+    # The final invoke is the second turn's agent call (an unknown prompt also
+    # triggers one classifier call, so don't rely on a fixed index).
+    second_turn_agent = rec.seen[-1]
+    assert "remember apples" in second_turn_agent  # prior user message retained
+    assert "ok" in second_turn_agent               # prior assistant reply retained
 
 
 def test_new_turn_does_not_re_emit_previous_turns_result():

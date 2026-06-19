@@ -186,25 +186,32 @@ def _resolve_task_id(text: str, current_tasks: list[dict]) -> str | None:
     return None
 
 
-def heuristic_parse_mutation(user_input: str, current_tasks: list[dict]) -> TaskMutation:
+def heuristic_parse_mutation(
+    user_input: str, current_tasks: list[dict], focus_task_id: str | None = None
+) -> TaskMutation:
     """Parse a CRUD request without an LLM (offline demo / tests / fallback).
 
     Deterministic keyword rules: delete/remove → delete, mark/complete/done →
     update status, otherwise create. Constructs a :class:`TaskMutation`, so the
     contract validation still runs — an unresolved ``task_id`` for update/delete
     is rejected exactly as in the LLM path.
+
+    ``focus_task_id`` is the task the user was last looking at; it is used only as
+    a fallback when the text itself names no task (e.g. a follow-up like "mark it
+    done"), so an explicit reference always wins.
     """
     low = user_input.lower()
 
     if any(kw in low for kw in _DELETE_KEYWORDS):
         return TaskMutation(
-            op=CrudOp.delete, task_id=_resolve_task_id(user_input, current_tasks)
+            op=CrudOp.delete,
+            task_id=_resolve_task_id(user_input, current_tasks) or focus_task_id,
         )
 
     if any(kw in low for kw in _DONE_KEYWORDS):
         return TaskMutation(
             op=CrudOp.update,
-            task_id=_resolve_task_id(user_input, current_tasks),
+            task_id=_resolve_task_id(user_input, current_tasks) or focus_task_id,
             status=Status.done,
         )
 
@@ -226,6 +233,7 @@ def llm_parse_mutation(
     current_tasks: list[dict],
     model_name: str,
     temperature: float = 0.0,
+    focus_task_id: str | None = None,
 ) -> TaskMutation:
     """Parse a CRUD request via Ollama structured output, then validate.
 
@@ -261,6 +269,15 @@ def llm_parse_mutation(
         if not data:
             raise ValueError("the model returned no task change")
         data = data[0]
+    # Follow-up like "change its category" names no task — fall back to the one
+    # the user was last looking at (never overrides a task_id the model resolved).
+    if (
+        isinstance(data, dict)
+        and focus_task_id
+        and data.get("op") in ("update", "delete")
+        and not data.get("task_id")
+    ):
+        data["task_id"] = focus_task_id
     return TaskMutation.model_validate(data)
 
 
@@ -332,7 +349,9 @@ class TodoAgent:
             errors=errors,
         )
 
-    def parse_mutation(self, user_input: str) -> TaskMutation:
+    def parse_mutation(
+        self, user_input: str, focus_task_id: str | None = None
+    ) -> TaskMutation:
         """Parse a CRUD request into a validated TaskMutation, retrying on bad output.
 
         Fetches the current tasks first (so a reference like "the gym task" can
@@ -340,13 +359,21 @@ class TodoAgent:
         validate-and-retry rule as :meth:`run`: a malformed or under-specified
         change never escapes downstream — it raises a recoverable
         :class:`ContractError` instead, which the caller surfaces to the user.
+
+        ``focus_task_id`` (the last task the user viewed) lets a follow-up that
+        omits the task — "change its category" — still resolve. It is forwarded
+        only when set, so simpler two-argument parsers stay compatible.
         """
         current = self._fetch_raw()
 
         errors: list[str] = []
         for attempt in range(1, self.max_retries + 1):
             try:
-                mutation = self._parse(user_input, current)
+                mutation = (
+                    self._parse(user_input, current, focus_task_id)
+                    if focus_task_id is not None
+                    else self._parse(user_input, current)
+                )
                 logger.info(
                     "TodoAgent parsed a '%s' mutation on attempt %d",
                     mutation.op.value,

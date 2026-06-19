@@ -28,8 +28,11 @@ from agents.planner_agent import (
     DEFAULT_WORKDAY,
     PRIORITY_EMOJI,
     DailyPlannerAgent,
+    Planner,
     Workday,
     format_plan,
+    llm_plan_day,
+    plan_day,
 )
 from agents.todo_agent import (
     ContractError,
@@ -43,7 +46,7 @@ from agents.todo_agent import (
     llm_parse_mutation,
     sample_raw_tasks,
 )
-from models.contract import CrudOp, TaskList, TaskMutation
+from models.contract import CrudOp, DayPlan, TaskList, TaskMutation
 
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
@@ -56,6 +59,8 @@ class Intent(str, Enum):
 
     plan = "plan"
     summary = "summary"
+    detail = "detail"
+    appointment = "appointment"
     add = "add"
     update = "update"
     delete = "delete"
@@ -97,8 +102,22 @@ _INTENT_KEYWORDS: list[tuple[Intent, tuple[str, ...]]] = [
 ]
 
 
+# A request for *one* task's details (e.g. "show me the detail of task X").
+# Checked before the keyword table because such prompts usually also contain a
+# summary trigger like "show me" / "list" — detail is the more specific intent.
+_DETAIL_KEYWORDS = ("detail", "tell me about", "more about", "info about", "info on")
+
+
+def wants_detail(user_input: str) -> bool:
+    """True if the prompt asks for a single task's details (not the whole list)."""
+    text = user_input.lower()
+    return any(kw in text for kw in _DETAIL_KEYWORDS)
+
+
 def classify_intent(user_input: str) -> Intent:
     """Classify intent with deterministic keyword rules (no LLM)."""
+    if wants_detail(user_input):
+        return Intent.detail
     text = user_input.lower()
     for intent, keywords in _INTENT_KEYWORDS:
         if any(kw in text for kw in keywords):
@@ -146,6 +165,61 @@ def llm_classify_intent(user_input: str, model_name: str) -> Intent:
 # ---------------------------------------------------------------------------
 # Summary formatting (no LLM)
 # ---------------------------------------------------------------------------
+
+
+# Words that carry no task-identifying signal — ignored when matching a prompt
+# to a task title so "show me the detail of task X" matches on "X", not "task".
+_DETAIL_STOPWORDS = frozenset({
+    "show", "me", "the", "detail", "details", "of", "task", "tell", "about",
+    "more", "info", "on", "a", "an", "for", "please", "what", "is", "are",
+})
+
+
+def _match_task(tasks: TaskList, user_input: str):
+    """Find the task the prompt refers to (or ``None`` if nothing matches).
+
+    Prefers a title that appears verbatim in the prompt (longest wins); otherwise
+    falls back to the task sharing the most significant words with the prompt.
+    """
+    import re
+
+    low = user_input.lower()
+    verbatim = [t for t in tasks.tasks if t.title.lower() in low]
+    if verbatim:
+        return max(verbatim, key=lambda t: len(t.title))
+
+    prompt_words = set(re.findall(r"\w+", low)) - _DETAIL_STOPWORDS
+    best, best_score = None, 0
+    for t in tasks.tasks:
+        title_words = set(re.findall(r"\w+", t.title.lower())) - _DETAIL_STOPWORDS
+        score = len(title_words & prompt_words)
+        if score > best_score:
+            best, best_score = t, score
+    return best if best_score > 0 else None
+
+
+def format_task_detail(task) -> str:
+    """Render a single task's full details (used by the 'detail' intent)."""
+    return "\n".join([
+        f"**{task.title}**",
+        "",
+        f"- Priority: {PRIORITY_EMOJI[task.priority.value]} {task.priority.value}",
+        f"- Estimate: {task.est_minutes} min",
+        f"- Category: {task.category}",
+        f"- Due: {task.due or '—'}",
+        f"- ID: {task.id}",
+    ])
+
+
+def format_detail(tasks: TaskList, user_input: str) -> str:
+    """Resolve the prompt to one task and render its details, or guide the user."""
+    task = _match_task(tasks, user_input)
+    if task is None:
+        names = ", ".join(f"'{t.title}'" for t in tasks.tasks) or "(none)"
+        return (
+            "I couldn't find a task matching that. Your tasks are: " + names + "."
+        )
+    return format_task_detail(task)
 
 
 def format_summary(tasks: TaskList) -> str:
@@ -204,6 +278,12 @@ class Orchestrator:
                 if isinstance(tasks, str):
                     return tasks
                 return format_summary(tasks)
+
+            case Intent.detail:
+                tasks = self._get_tasks_or_message(intent)
+                if isinstance(tasks, str):
+                    return tasks
+                return format_detail(tasks, user_input)
 
             case Intent.add:
                 return (
@@ -337,16 +417,50 @@ def make_mutation_parser(
     if not use_llm:
         return heuristic_parse_mutation
 
-    def parse(user_input: str, current_tasks: list[dict]) -> TaskMutation:
+    def parse(
+        user_input: str,
+        current_tasks: list[dict],
+        focus_task_id: str | None = None,
+    ) -> TaskMutation:
         try:
-            return llm_parse_mutation(user_input, current_tasks, model_name, temperature)
+            return llm_parse_mutation(
+                user_input, current_tasks, model_name, temperature, focus_task_id
+            )
         except (ValidationError, ValueError, json.JSONDecodeError):
             raise  # recoverable — let TodoAgent retry the model
         except Exception as exc:  # noqa: BLE001 — model down etc.
             logger.warning("LLM mutation parse failed (%s); using heuristics.", exc)
-            return heuristic_parse_mutation(user_input, current_tasks)
+            return heuristic_parse_mutation(user_input, current_tasks, focus_task_id)
 
     return parse
+
+
+def make_planner(
+    model_name: str, temperature: float, use_llm: bool, max_retries: int = 2
+) -> Planner:
+    """Build a day planner that prefers the LLM but always returns a valid plan.
+
+    With ``use_llm`` off it is the deterministic :func:`plan_day`. With it on, the
+    LLM is asked for a schedule and validated (types + the semantic checks in
+    ``_validate_plan``); on repeated failure or an unreachable model it falls back
+    to :func:`plan_day`, so a usable plan is guaranteed either way.
+    """
+    if not use_llm:
+        return lambda tasks, workday, date=None: plan_day(tasks, workday=workday, date=date)
+
+    def plan(tasks: TaskList, workday: Workday, date: str | None = None) -> DayPlan:
+        for attempt in range(1, max_retries + 1):
+            try:
+                return llm_plan_day(tasks, workday, model_name, temperature, date)
+            except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("LLM plan attempt %d failed (%s)", attempt, exc)
+            except Exception as exc:  # noqa: BLE001 — model down etc.
+                logger.warning("LLM planning failed (%s); using deterministic planner.", exc)
+                break
+        logger.info("Falling back to the deterministic planner.")
+        return plan_day(tasks, workday=workday, date=date)
+
+    return plan
 
 
 def make_mutation_executor(tools: list[BaseTool]) -> MutationExecutor:

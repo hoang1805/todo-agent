@@ -13,10 +13,19 @@ without an LLM.
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Callable
 
 from models.contract import DayPlan, MealBreak, Task, TaskList, TimeBlock
+
+logger = logging.getLogger(__name__)
+
+#: A function that turns a TaskList + Workday (+ optional date) into a DayPlan.
+Planner = Callable[[TaskList, "Workday", "str | None"], DayPlan]
 
 #: Priority → emoji, shared by the plan and summary renderers.
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
@@ -51,6 +60,137 @@ class Workday:
 
 
 DEFAULT_WORKDAY = Workday()
+
+
+# A time like "7", "7:30", "7h30", "7am", "11 pm" — hour, optional minutes
+# (``:`` or ``h`` separator), optional am/pm.
+_TIME = r"(\d{1,2})(?:[:h](\d{2}))?\s*([ap]\.?m\.?)?"
+# A range: "<time> to/until/till/through/- <time>" (e.g. "from 7am to 11pm").
+_RANGE_RE = re.compile(
+    rf"{_TIME}\s*(-|–|—|to|until|till|through)\s*{_TIME}", re.IGNORECASE
+)
+
+
+def _to_24h(hour: str | int, minute: str | None, ampm: str | None) -> str | None:
+    """Render a parsed clock time as ``HH:MM`` (24-hour), or ``None`` if invalid."""
+    hour = int(hour)
+    minute = int(minute or 0)
+    ap = (ampm or "").lower().replace(".", "")
+    if ap == "pm" and hour != 12:
+        hour += 12
+    elif ap == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _range_from_match(match: re.Match) -> tuple[str, str] | None:
+    """Turn a :data:`_RANGE_RE` match into a validated ``(start, end)`` pair."""
+    sh, sm, sap, conn, eh, em, eap = match.groups()
+    # A bare dash range with no am/pm or minutes ("06-18") is more likely a date
+    # or plain number range than a clock range — ignore it to avoid false hits.
+    if conn in ("-", "–", "—") and not (sap or eap or sm or em):
+        return None
+    start = _to_24h(sh, sm, sap)
+    end = _to_24h(eh, em, eap)
+    if not start or not end:
+        return None
+    # "9 to 5" (no am/pm, end ≤ start) almost certainly means a PM end.
+    if end <= start and not eap and int(eh) < 12:
+        end = _to_24h(int(eh) + 12, em, None)
+    if not end or end <= start:
+        return None
+    return start, end
+
+
+def parse_workday(text: str, base: Workday = DEFAULT_WORKDAY) -> Workday | None:
+    """Extract working hours from free text (e.g. "I work from 7am to 11pm").
+
+    Returns a :class:`Workday` with the parsed ``start``/``end`` and *base*'s meal
+    breaks, or ``None`` if no hour range is found. Meal breaks are preserved so
+    a wider window still schedules lunch/dinner correctly.
+    """
+    match = _RANGE_RE.search(text or "")
+    if not match:
+        return None
+    rng = _range_from_match(match)
+    if not rng:
+        return None
+    start, end = rng
+    return Workday(start=start, end=end, breaks=base.breaks)
+
+
+# Event words / lead-ins that mark a phrase as a *fixed-time commitment*
+# ("I have a dinner from 17:30 to 19:30") rather than working hours.
+_EVENT_WORDS = (
+    "dinner", "lunch", "breakfast", "brunch", "meeting", "appointment", "call",
+    "party", "event", "interview", "doctor", "dentist", "standup", "stand-up",
+    "sync", "class", "gym", "workout", "date",
+)
+_APPT_LEADINS = (
+    "i have", "i've got", "i ve got", "i got", "there's", "there is",
+    "i'll have", "i will have", "i am going", "i'm going", "i'll be", "i will be",
+)
+_LABEL_LEADIN_RE = re.compile(
+    r"^(?:please\s+)?"
+    r"(?:i\s+(?:have|'?ve\s+got|got|will\s+have|am\s+having|'?m\s+having)|"
+    r"there\s+(?:is|'s)|i\s*'?ll\s+(?:have|be)|i\s+will\s+be)\s+"
+    r"(?:an?\s+)?",
+    re.IGNORECASE,
+)
+
+
+def _appointment_label(text: str, upto: int) -> str:
+    """Derive an event name from the words before the time range (best-effort)."""
+    head = text[:upto].strip()
+    head = re.sub(r"\b(from|at|on|starting|between|@)\s*$", "", head, flags=re.I).strip()
+    head = _LABEL_LEADIN_RE.sub("", head).strip(" ,.-—–")
+    if not head:
+        return "Appointment"
+    return head[0].upper() + head[1:]
+
+
+def parse_appointment(text: str) -> Break | None:
+    """Parse a fixed-time commitment ("dinner with family 17:30–19:30") to a Break.
+
+    Returns ``None`` for working-hours statements ("I work 7am–11pm") and for any
+    text without both a time range *and* an event cue, so it doesn't fire on plain
+    planning requests.
+    """
+    low = (text or "").lower()
+    if "work" in low:  # "I work from 7 to 11" is the day window, not an event
+        return None
+    match = _RANGE_RE.search(text or "")
+    if not match:
+        return None
+    rng = _range_from_match(match)
+    if not rng:
+        return None
+    if not (any(w in low for w in _EVENT_WORDS) or any(p in low for p in _APPT_LEADINS)):
+        return None
+    start, end = rng
+    return Break(name=_appointment_label(text, match.start()), start=start, end=end)
+
+
+def workday_with_appointments(workday: Workday, appointments: list[dict]) -> Workday:
+    """Return *workday* with *appointments* merged in as fixed blocks.
+
+    Each appointment (``{"name", "start", "end"}``) becomes a :class:`Break` the
+    planner schedules around. A default meal break that overlaps an appointment is
+    dropped in its favour (so a 17:30–19:30 dinner replaces the generic 18:00
+    dinner slot rather than double-booking it).
+    """
+    if not appointments:
+        return workday
+    appts = [Break(name=a["name"], start=a["start"], end=a["end"]) for a in appointments]
+
+    def overlaps(b1: Break, b2: Break) -> bool:
+        return _t(b1.start) < _t(b2.end) and _t(b2.start) < _t(b1.end)
+
+    kept = [b for b in workday.breaks if not any(overlaps(b, a) for a in appts)]
+    merged = tuple(sorted(kept + appts, key=lambda b: _t(b.start)))
+    return Workday(start=workday.start, end=workday.end, breaks=merged)
 
 
 def _t(hhmm: str) -> datetime:
@@ -202,6 +342,103 @@ def plan_day(
         deferred=deferred,
         breaks=meal_blocks,
     )
+
+
+# ---------------------------------------------------------------------------
+# LLM planning — the model decides the schedule; the contract keeps it honest
+# ---------------------------------------------------------------------------
+
+
+def _validate_plan(plan: DayPlan, tasks: TaskList, workday: Workday) -> DayPlan:
+    """Reject a model-produced plan that isn't a usable schedule.
+
+    Type validity is already guaranteed by :class:`DayPlan`; this adds the
+    *semantic* checks the contract can't express — blocks inside the working
+    window, no overlaps (including meal breaks), real task ids, and every task
+    accounted for (scheduled or deferred). A failure raises ``ValueError`` so the
+    caller can retry the model or fall back to the deterministic planner.
+    """
+    win_start, win_end = _t(workday.start), _t(workday.end)
+    valid_ids = {t.id for t in tasks.tasks}
+
+    intervals: list[tuple[datetime, datetime, str]] = []
+    scheduled: set[str] = set()
+    for b in plan.blocks:
+        if b.task_id not in valid_ids:
+            raise ValueError(f"plan references unknown task_id {b.task_id!r}")
+        if b.task_id in scheduled:
+            raise ValueError(f"task {b.task_id!r} is scheduled more than once")
+        scheduled.add(b.task_id)
+        s, e = _t(b.start), _t(b.end)
+        if not (win_start <= s < e <= win_end):
+            raise ValueError(f"block {b.title!r} ({b.start}-{b.end}) is outside working hours")
+        intervals.append((s, e, b.title))
+
+    # Breaks and fixed appointments occupy the timeline too — nothing may overlap
+    # them. Use the *workday's* breaks (the source of truth) so a task can't be
+    # placed over an appointment even if the model dropped it from its output.
+    for brk in workday.breaks:
+        bs, be = _t(brk.start), _t(brk.end)
+        if be > win_start and bs < win_end:
+            intervals.append((bs, be, brk.name))
+
+    intervals.sort()
+    for (s1, e1, t1), (s2, e2, t2) in zip(intervals, intervals[1:]):
+        if s2 < e1:
+            raise ValueError(f"overlapping blocks: {t1!r} and {t2!r}")
+
+    for t in plan.deferred:
+        if t.id not in valid_ids:
+            raise ValueError(f"deferred references unknown task {t.id!r}")
+
+    accounted = scheduled | {t.id for t in plan.deferred}
+    if accounted != valid_ids:
+        raise ValueError(f"tasks neither scheduled nor deferred: {valid_ids - accounted}")
+    return plan
+
+
+def llm_plan_day(
+    tasks: TaskList,
+    workday: Workday,
+    model_name: str,
+    temperature: float = 0.0,
+    date: str | None = None,
+) -> DayPlan:
+    """Plan the day with an LLM, returning a validated :class:`DayPlan`.
+
+    The JSON schema is generated *from* ``DayPlan`` so the model is constrained to
+    the contract's shape; the result is then validated (types **and** the
+    semantic checks in :func:`_validate_plan`). On any failure this raises, so the
+    caller (see :func:`make_planner`) can retry or fall back to :func:`plan_day`.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from agents.todo_agent import _loads_jsonish
+    from core.services.llm_client import create_ollama_model
+    from core.services.prompts import load_prompt
+
+    schema = DayPlan.model_json_schema()
+    llm = create_ollama_model(model_name, temperature, format=schema, with_thinking=False)
+    payload = {
+        "date": date,
+        "working_hours": {"start": workday.start, "end": workday.end},
+        "available_minutes": working_minutes(workday),
+        "breaks": [{"name": b.name, "start": b.start, "end": b.end} for b in workday.breaks],
+        "tasks": [t.model_dump(mode="json") for t in tasks.tasks],
+    }
+    response = llm.invoke(
+        [
+            SystemMessage(content=load_prompt("planner_agent_system")),
+            HumanMessage(content=json.dumps(payload, default=str)),
+        ]
+    )
+    data = _loads_jsonish(response.content)
+    if isinstance(data, list):  # model wrapped the plan in an array
+        if not data:
+            raise ValueError("the model returned no plan")
+        data = data[0]
+    plan = DayPlan.model_validate(data)
+    return _validate_plan(plan, tasks, workday)
 
 
 # ---------------------------------------------------------------------------

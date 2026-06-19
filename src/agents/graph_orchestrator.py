@@ -69,23 +69,30 @@ from langgraph.types import Command, interrupt
 
 from agents.human_in_the_loop import wrap_mutating_tools
 from agents.orchestrator import (
+    Intent,
     MutationExecutor,
     _run_coro,
     classify_intent,
+    format_detail,
     format_summary,
     is_crud_intent,
+    llm_classify_intent,
+    wants_detail,
     make_mcp_fetcher,
     make_mutation_executor,
     make_mutation_parser,
     make_normalizer,
+    make_planner,
     matched_intent_families,
 )
 from agents.planner_agent import (
     DEFAULT_WORKDAY,
-    DailyPlannerAgent,
+    Planner,
     Workday,
     format_plan,
-    plan_day,
+    parse_appointment,
+    parse_workday,
+    workday_with_appointments,
 )
 from pydantic import ValidationError
 
@@ -174,6 +181,15 @@ class PlannerState(TypedDict):
     # The validated CRUD change as a JSON-native dict (so the checkpointer stores
     # only plain types, not custom classes). Reconstructed via TaskMutation when used.
     mutation: NotRequired[dict | None]
+    # The task the user last looked at / acted on, as ``{"id", "title"}``. Unlike
+    # the other per-turn fields it is NOT reset between turns, so a follow-up like
+    # "change its category" can resolve to it (see `extract_mutation`).
+    focus_task: NotRequired[dict | None]
+    # Fixed-time commitments for the day, each ``{"name", "start", "end"}``, and
+    # the last stated working hours ``{"start", "end"}``. Both persist across turns
+    # so "replan today" keeps honoring them (see `run_planner`).
+    appointments: NotRequired[list[dict]]
+    work_hours: NotRequired[dict | None]
     approved: NotRequired[bool]  # set by the confirm node from the user's decision
     notice: NotRequired[str]     # success line prepended to the re-planned result
     # `add_messages` makes this an append-only log — the agent⇄tools loop's memory.
@@ -205,6 +221,7 @@ def build_graph_orchestrator(
     checkpointer_db: str | None = None,
     mutation_parser: MutationParser | None = None,
     mutation_executor: MutationExecutor | None = None,
+    planner: Planner | None = None,
     observe: bool = False,
 ):
     """Wire and compile the LangGraph orchestrator.
@@ -215,22 +232,22 @@ def build_graph_orchestrator(
 
     ``checkpointer_db`` enables a persistent (SQLite) checkpointer so interrupt/
     resume survives restarts; left ``None`` it uses an in-memory saver (tests).
-    ``mutation_parser`` / ``mutation_executor`` are injectable so the CRUD path
-    is testable without an LLM or a live MCP server.
+    ``mutation_parser`` / ``mutation_executor`` / ``planner`` are injectable so
+    the CRUD and planning paths are testable without an LLM or a live MCP server.
     """
     workday = workday or DEFAULT_WORKDAY
     mutation_parser = mutation_parser or make_mutation_parser(model_name, temperature, use_llm)
     mutation_executor = mutation_executor or make_mutation_executor(tools)
+    planner = planner or make_planner(model_name, temperature, use_llm)
     todo_agent = TodoAgent(
         fetch_raw=make_mcp_fetcher(tools),
         normalize=make_normalizer(model_name, temperature, use_llm),
         parse=mutation_parser,
     )
-    planner_agent = DailyPlannerAgent(workday=workday)
 
-    # The deterministic capabilities, exposed as tools so the agent loop can
-    # sequence them with the MCP tools for multi-step prompts. The planning math
-    # stays inside the tool — only the *ordering* is delegated to the LLM.
+    # The capabilities, exposed as tools so the agent loop can sequence them with
+    # the MCP tools for multi-step prompts. Planning goes through the injected
+    # `planner` (LLM with a validated deterministic fallback).
     def _plan_tool(day_start: str | None = None, day_end: str | None = None) -> str:
         try:
             tasks = todo_agent.run()
@@ -243,7 +260,7 @@ def build_graph_orchestrator(
                 end=day_end or workday.end,
                 breaks=workday.breaks,
             )
-        return format_plan(plan_day(tasks, workday=wd))
+        return format_plan(planner(tasks, wd, None))
 
     def _summary_tool() -> str:
         try:
@@ -294,12 +311,29 @@ def build_graph_orchestrator(
     def classify(state: PlannerState) -> dict:
         # Echo the user's prompt before any reasoning (for logs/observability).
         logger.info("USER PROMPT: %s", state["user_input"])
+        # A fixed-time commitment ("dinner with family from 17:30 to 19:30") is
+        # registered as an appointment and the day re-planned around it — never
+        # turned into a flexible task.
+        if parse_appointment(state["user_input"]) is not None:
+            return {"intent": "appointment"}
+        # "show me the detail of task X" usually also trips a summary keyword
+        # ("show me"); detail is the more specific intent, so resolve it first
+        # before the multi-family check would mis-route it to the agent loop.
+        if wants_detail(state["user_input"]):
+            return {"intent": "detail"}
         # A prompt that touches more than one intent family (e.g. "plan my day
         # AND add a task") is multi-step — send it to the agent loop, which can
         # sequence several tools, instead of a single deterministic path.
         if len(set(matched_intent_families(state["user_input"]))) > 1:
             return {"intent": "complex"}
-        return {"intent": classify_intent(state["user_input"]).value}
+        # Keyword rules are instant and deterministic for clear prompts. Only when
+        # they can't tell (unknown) do we spend an LLM call to classify natural
+        # phrasing — and `llm_classify_intent` itself falls back to keywords on any
+        # error, so this never makes classification less reliable.
+        intent = classify_intent(state["user_input"])
+        if intent is Intent.unknown and use_llm:
+            intent = llm_classify_intent(state["user_input"], model_name)
+        return {"intent": intent.value}
 
     def run_todo(state: PlannerState) -> dict:
         try:
@@ -310,12 +344,55 @@ def build_graph_orchestrator(
             logger.error("Contract failed: %s", exc.errors)
             return {"error": _CONTRACT_ERROR_MSG}
 
+    def register_appointment(state: PlannerState) -> dict:
+        """Record a fixed-time commitment so the re-plan schedules around it."""
+        appt = parse_appointment(state["user_input"])
+        if appt is None:  # defensive — classify already gated this
+            return {}
+        entry = {"name": appt.name, "start": appt.start, "end": appt.end}
+        appointments = list(state.get("appointments") or [])
+        if entry not in appointments:
+            appointments.append(entry)
+        return {
+            "appointments": appointments,
+            "notice": f"📌 Noted '{appt.name}' from {appt.start} to {appt.end}.",
+        }
+
     def run_planner(state: PlannerState) -> dict:
-        plan = planner_agent.run(TaskList.model_validate(state["tasks"]), date=state.get("date"))
-        return {"result": format_plan(plan)}
+        # Working hours: parse from the prompt only when the user is explicitly
+        # planning ("I work from 7am to 11pm") — otherwise a time range in the
+        # text is an appointment, not the day window. Reuse the last hours so
+        # "replan today" keeps them; fall back to the configured workday.
+        work_hours = state.get("work_hours")
+        parsed = parse_workday(state["user_input"]) if state.get("intent") == "plan" else None
+        if parsed is not None:
+            wd = parsed
+            work_hours = {"start": parsed.start, "end": parsed.end}
+        elif work_hours:
+            wd = Workday(start=work_hours["start"], end=work_hours["end"], breaks=workday.breaks)
+        else:
+            wd = workday
+        # Fold in any fixed-time commitments, then plan (LLM + safe fallback).
+        wd = workday_with_appointments(wd, state.get("appointments") or [])
+        plan = planner(TaskList.model_validate(state["tasks"]), wd, state.get("date"))
+        out: dict = {"result": format_plan(plan)}
+        if work_hours:
+            out["work_hours"] = work_hours
+        return out
 
     def run_summary(state: PlannerState) -> dict:
         return {"result": format_summary(TaskList.model_validate(state["tasks"]))}
+
+    def run_detail(state: PlannerState) -> dict:
+        from agents.orchestrator import _match_task
+
+        tasks = TaskList.model_validate(state["tasks"])
+        out: dict = {"result": format_detail(tasks, state["user_input"])}
+        # Remember which task this was about so a follow-up edit can refer to it.
+        task = _match_task(tasks, state["user_input"])
+        if task is not None:
+            out["focus_task"] = {"id": task.id, "title": task.title}
+        return out
 
     # -- CRUD path: validate (contract checkpoint) → confirm → execute → replan --
 
@@ -324,9 +401,15 @@ def build_graph_orchestrator(
 
         Stored as a JSON-native dict so the checkpointer persists only plain types.
         """
+        focus_id = (state.get("focus_task") or {}).get("id")
         try:
-            mutation = todo_agent.parse_mutation(state["user_input"])
-            return {"mutation": mutation.model_dump(mode="json", exclude_none=True)}
+            mutation = todo_agent.parse_mutation(state["user_input"], focus_task_id=focus_id)
+            out: dict = {"mutation": mutation.model_dump(mode="json", exclude_none=True)}
+            # Keep the focus on whichever task this change targets, so a further
+            # follow-up ("and mark it done") chains to the same task.
+            if mutation.task_id:
+                out["focus_task"] = {"id": mutation.task_id, "title": mutation.title}
+            return out
         except ContractError as exc:
             logger.error("Mutation parse failed: %s", exc.errors)
             return {"error": _MUTATION_PARSE_ERROR_MSG}
@@ -417,7 +500,9 @@ def build_graph_orchestrator(
         # plan/summary → deterministic read pipeline; add/update/delete → CRUD
         # path; everything else (incl. multi-intent "complex") → the agent loop.
         intent = state["intent"]
-        if intent in ("plan", "summary"):
+        if intent == "appointment":
+            return "appointment"
+        if intent in ("plan", "summary", "detail"):
             return "todo"
         if intent in ("add", "update", "delete"):
             return "crud"
@@ -426,8 +511,13 @@ def build_graph_orchestrator(
     def route_after_todo(state: PlannerState) -> str:
         if state.get("error"):
             return "finalize"
-        # summary just lists; plan and any post-CRUD re-plan go to the planner.
-        return "summary" if state["intent"] == "summary" else "planner"
+        # summary lists all; detail shows one task; plan and any post-CRUD
+        # re-plan go to the planner.
+        if state["intent"] == "summary":
+            return "summary"
+        if state["intent"] == "detail":
+            return "detail"
+        return "planner"
 
     def route_after_extract(state: PlannerState) -> str:
         return "finalize" if state.get("error") else "confirm_mutation"
@@ -452,6 +542,8 @@ def build_graph_orchestrator(
     g.add_node("todo", node("todo", run_todo))
     g.add_node("planner", node("planner", run_planner))
     g.add_node("summary", node("summary", run_summary))
+    g.add_node("detail", node("detail", run_detail))
+    g.add_node("register_appointment", node("register_appointment", register_appointment))
     g.add_node("extract_mutation", node("extract_mutation", extract_mutation))
     g.add_node("confirm_mutation", node("confirm_mutation", confirm_mutation))
     g.add_node("execute_mutation", node("execute_mutation", execute_mutation))
@@ -462,11 +554,14 @@ def build_graph_orchestrator(
     g.add_edge(START, "classify")
     g.add_conditional_edges(
         "classify", route_by_intent,
-        {"todo": "todo", "crud": "extract_mutation", "agent": "agent"},
+        {"todo": "todo", "crud": "extract_mutation", "agent": "agent",
+         "appointment": "register_appointment"},
     )
+    g.add_edge("register_appointment", "todo")  # register, then re-plan the day
     g.add_conditional_edges(
         "todo", route_after_todo,
-        {"planner": "planner", "summary": "summary", "finalize": "finalize"},
+        {"planner": "planner", "summary": "summary", "detail": "detail",
+         "finalize": "finalize"},
     )
     g.add_conditional_edges(
         "extract_mutation", route_after_extract,
@@ -482,6 +577,7 @@ def build_graph_orchestrator(
     )
     g.add_edge("planner", "finalize")
     g.add_edge("summary", "finalize")
+    g.add_edge("detail", "finalize")
     g.add_conditional_edges(
         "agent", should_continue, {"tools": "tools", "finalize": "finalize"}
     )

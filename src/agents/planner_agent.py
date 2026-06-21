@@ -20,7 +20,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable
 
-from models.contract import DayPlan, MealBreak, Task, TaskList, TimeBlock
+from models.contract import (
+    CrudOp,
+    DayPlan,
+    MealBreak,
+    Priority,
+    Status,
+    Task,
+    TaskList,
+    TaskMutation,
+    TimeBlock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +112,18 @@ def _range_from_match(match: re.Match) -> tuple[str, str] | None:
     if not end or end <= start:
         return None
     return start, end
+
+
+_REPLAN_KEYWORDS = (
+    "replan", "re-plan", "re plan", "redo the plan", "redo my plan",
+    "new plan", "regenerate the plan", "make a new plan", "plan again",
+)
+
+
+def wants_replan(text: str) -> bool:
+    """True if the prompt explicitly asks to regenerate the plan (not just show it)."""
+    low = (text or "").lower()
+    return any(kw in low for kw in _REPLAN_KEYWORDS)
 
 
 def parse_workday(text: str, base: Workday = DEFAULT_WORKDAY) -> Workday | None:
@@ -345,6 +367,72 @@ def plan_day(
 
 
 # ---------------------------------------------------------------------------
+# Locked-plan edits — patch an accepted plan in place, without re-scheduling
+# ---------------------------------------------------------------------------
+
+
+def apply_mutation_to_plan(plan: DayPlan, mutation: TaskMutation) -> DayPlan:
+    """Apply one confirmed CRUD change to a *locked* plan, in place.
+
+    A locked plan is the user's committed schedule, so this never re-plans — it
+    patches minimally: mark a block done, drop a deleted task, edit a block's
+    fields, or append a newly-created task after the last block (best-effort).
+    Returns a new :class:`DayPlan` (the input is left untouched).
+    """
+    blocks = [b.model_copy() for b in plan.blocks]
+    deferred = [t.model_copy() for t in plan.deferred]
+    tid = mutation.task_id
+
+    if mutation.op is CrudOp.delete:
+        blocks = [b for b in blocks if b.task_id != tid]
+        deferred = [t for t in deferred if t.id != tid]
+
+    elif mutation.op is CrudOp.update:
+        for b in blocks:
+            if b.task_id != tid:
+                continue
+            if mutation.status is Status.done:
+                b.done = True
+            if mutation.title is not None:
+                b.title = mutation.title
+            if mutation.priority is not None:
+                b.priority = mutation.priority
+            if mutation.est_minutes is not None:
+                b.est_minutes = mutation.est_minutes
+        for t in deferred:
+            if t.id != tid:
+                continue
+            if mutation.title is not None:
+                t.title = mutation.title
+            if mutation.priority is not None:
+                t.priority = mutation.priority
+            if mutation.est_minutes is not None:
+                t.est_minutes = mutation.est_minutes
+            if mutation.category is not None:
+                t.category = mutation.category
+            if mutation.due is not None:
+                t.due = mutation.due
+
+    elif mutation.op is CrudOp.create:
+        # No re-plan: append after the last scheduled block (best-effort).
+        est = mutation.est_minutes or 30
+        last_end = max((_t(b.end) for b in blocks), default=_t("09:00"))
+        new_end = last_end + timedelta(minutes=est)
+        blocks.append(
+            TimeBlock(
+                task_id=tid or f"new-{(mutation.title or 'task').lower()}",
+                title=mutation.title or "New task",
+                priority=mutation.priority or Priority.medium,
+                start=_fmt(last_end),
+                end=_fmt(new_end),
+                est_minutes=est,
+            )
+        )
+
+    return plan.model_copy(update={"blocks": blocks, "deferred": deferred})
+
+
+# ---------------------------------------------------------------------------
 # LLM planning — the model decides the schedule; the contract keeps it honest
 # ---------------------------------------------------------------------------
 
@@ -459,10 +547,16 @@ def format_plan(plan: DayPlan) -> str:
     if timeline:
         for kind, item in timeline:
             if kind == "task":
-                lines.append(
-                    f"  {item.start}–{item.end}  {PRIORITY_EMOJI[item.priority.value]} "
-                    f"{item.title} ({item.est_minutes} min)"
-                )
+                if getattr(item, "done", False):
+                    lines.append(
+                        f"  {item.start}–{item.end}  ✅ ~~{item.title}~~ "
+                        f"({item.est_minutes} min)"
+                    )
+                else:
+                    lines.append(
+                        f"  {item.start}–{item.end}  {PRIORITY_EMOJI[item.priority.value]} "
+                        f"{item.title} ({item.est_minutes} min)"
+                    )
             else:
                 lines.append(f"  {item.start}–{item.end}  🍽️ {item.name}")
     else:

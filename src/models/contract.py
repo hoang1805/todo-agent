@@ -93,6 +93,7 @@ class TimeBlock(BaseModel):
     start: str  # HH:MM, 24-hour
     end: str  # HH:MM, 24-hour
     est_minutes: int
+    done: bool = False  # marked complete in a *locked* plan (see apply_mutation_to_plan)
 
     @field_validator("task_id", mode="before")
     @classmethod

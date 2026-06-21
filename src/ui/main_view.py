@@ -305,6 +305,33 @@ def _rebuild_args(original_args: dict, edited_rows, properties: dict) -> dict:
     return new_args
 
 
+def _render_plan_approval(planner, pending: dict) -> None:
+    """Render the plan-confirmation panel: accept & lock, or re-plan with a hint."""
+    intr = pending["interrupt"]
+    st.info(intr.get("message", "Accept this plan for today?"))
+    st.markdown(_as_markdown(intr.get("plan", "")))
+    suggestion = st.text_input(
+        "Suggest a change (optional) — e.g. \"I can work until 11pm\" or "
+        "\"keep 3-4pm free for a call\"",
+        key="plan_suggestion",
+    )
+    accept, reject = st.columns(2)
+    if accept.button("✅ Accept & lock", use_container_width=True, key="plan_accept"):
+        with st.spinner("Locking the plan…"):
+            result = planner.resume(pending["thread_id"], {"action": "accept"})
+        st.session_state.pop("plan_suggestion", None)
+        _consume_planner_result(result)
+        st.rerun()
+    if reject.button("✏️ Re-plan with my suggestion", use_container_width=True, key="plan_reject"):
+        with st.spinner("Re-planning…"):
+            result = planner.resume(
+                pending["thread_id"], {"action": "reject", "reason": suggestion}
+            )
+        st.session_state.pop("plan_suggestion", None)
+        _consume_planner_result(result)
+        st.rerun()
+
+
 def _render_approval_panel(planner, tools: list[BaseTool]) -> None:
     """Render an editable review table for a pending mutating action.
 
@@ -316,6 +343,10 @@ def _render_approval_panel(planner, tools: list[BaseTool]) -> None:
     """
     pending = st.session_state.planner_pending
     intr = pending["interrupt"]
+    # Plan confirmation uses a lighter accept/suggest panel, not the edit table.
+    if intr.get("type") == "plan_approval":
+        _render_plan_approval(planner, pending)
+        return
     args = intr.get("args") or {}
     mutation = _is_mutation(args)
 

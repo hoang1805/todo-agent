@@ -25,6 +25,7 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 MCP_SERVERS = {
     "task_mcp": os.getenv("TASK_MCP_URL", "http://localhost:8000/sse"),
+    "memory_mcp": os.getenv("MEMORY_MCP_URL", "http://localhost:8002/sse"),
 }
 
 # Resolved relative to the package so it works regardless of the current

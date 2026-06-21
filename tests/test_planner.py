@@ -4,10 +4,14 @@ from agents.planner_agent import (
     Break,
     DailyPlannerAgent,
     Workday,
+    apply_mutation_to_plan,
+    format_plan,
     plan_day,
     rank_tasks,
+    wants_replan,
     working_minutes,
 )
+from models.contract import CrudOp, Status, TaskMutation
 from models.contract import Task, TaskList
 
 # A break-free workday makes the contiguous-scheduling assertions simple.
@@ -127,6 +131,52 @@ def test_meal_task_claims_the_matching_break():
     assert "dinner with ceo" in dinner.name.lower()            # break shows the task
     assert all(t.title != tasks.tasks[1].title for t in plan.deferred)  # never deferred
     assert all(b.title != tasks.tasks[1].title for b in plan.blocks)    # not a work block
+
+
+def _two_task_plan():
+    tasks = TaskList(tasks=[
+        Task(id="1", title="Write report", priority="high", est_minutes=60, category="work"),
+        Task(id="2", title="Call bank", priority="low", est_minutes=30, category="errand"),
+    ])
+    return plan_day(tasks, workday=NO_BREAKS)
+
+
+def test_wants_replan_detects_explicit_regenerate():
+    assert wants_replan("replan my day") and wants_replan("redo the plan please")
+    assert not wants_replan("plan my day")
+    assert not wants_replan("what's on my list?")
+
+
+def test_apply_mutation_marks_block_done_without_touching_original():
+    plan = _two_task_plan()
+    updated = apply_mutation_to_plan(
+        plan, TaskMutation(op=CrudOp.update, task_id="1", status=Status.done)
+    )
+    assert next(b for b in updated.blocks if b.task_id == "1").done is True
+    assert next(b for b in plan.blocks if b.task_id == "1").done is False  # input untouched
+    out = format_plan(updated)
+    assert "✅" in out and "~~Write report~~" in out
+
+
+def test_apply_mutation_delete_drops_the_block():
+    updated = apply_mutation_to_plan(_two_task_plan(), TaskMutation(op=CrudOp.delete, task_id="2"))
+    assert all(b.task_id != "2" for b in updated.blocks)
+
+
+def test_apply_mutation_create_appends_a_block():
+    plan = _two_task_plan()
+    updated = apply_mutation_to_plan(
+        plan, TaskMutation(op=CrudOp.create, title="New thing", est_minutes=20)
+    )
+    assert len(updated.blocks) == len(plan.blocks) + 1
+    assert any(b.title == "New thing" for b in updated.blocks)
+
+
+def test_apply_mutation_edit_updates_block_fields():
+    updated = apply_mutation_to_plan(
+        _two_task_plan(), TaskMutation(op=CrudOp.update, task_id="1", est_minutes=90)
+    )
+    assert next(b for b in updated.blocks if b.task_id == "1").est_minutes == 90
 
 
 def test_meal_task_is_ordinary_without_a_matching_break():

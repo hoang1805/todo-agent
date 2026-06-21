@@ -168,6 +168,93 @@ def test_mutating_tool_is_not_run_on_reject(monkeypatch):
     assert "id" not in executed  # never executed
 
 
+# -- plan confirmation + lock ------------------------------------------------
+
+
+def _plannable():
+    """A graph with the deterministic planner, sample tasks, and a stub executor."""
+    return build_graph_orchestrator(
+        tools=[], model_name="dummy", use_llm=False,
+        workday=Workday(start="09:00", end="18:00"),
+        mutation_executor=lambda m: f"Updated {m.task_id}",
+    )
+
+
+def _lock(go, thread="lk"):
+    go.start("plan my day", thread_id=thread, date="2026-06-17")
+    return go.resume(thread, {"action": "accept"})
+
+
+def test_plan_requires_confirmation_then_locks():
+    go = _plannable()
+    pending = go.start("plan my day", thread_id="lk", date="2026-06-17")
+    assert pending.status == "interrupted"
+    assert pending.interrupt["type"] == "plan_approval"
+    assert "Your plan" in pending.interrupt["plan"]
+
+    done = go.resume("lk", {"action": "accept"})
+    assert done.status == "done" and "🔒" in done.text
+
+
+def test_plan_reject_with_suggestion_replans_then_reconfirms():
+    go = _plannable()
+    go.start("plan my day", thread_id="rj", date="2026-06-17")
+    again = go.resume("rj", {"action": "reject", "reason": "I can work from 7am to 11pm"})
+    assert again.status == "interrupted" and again.interrupt["type"] == "plan_approval"
+    done = go.resume("rj", {"action": "accept"})
+    assert "🔒" in done.text
+
+
+def test_locked_plan_mark_done_annotates_in_place():
+    go = _plannable()
+    _lock(go)
+    pending = go.start("mark Finish Q3 report as done", thread_id="lk")
+    assert pending.status == "interrupted" and pending.interrupt["type"] == "approval"
+    done = go.resume("lk", {"action": "accept"})
+    assert "✅" in done.text and "~~Finish Q3 report~~" in done.text
+
+
+def test_plain_plan_shows_locked_plan_without_reconfirming():
+    go = _plannable()
+    _lock(go)
+    res = go.start("plan my day", thread_id="lk")  # no "replan"
+    assert res.status == "done"            # show_locked — no interrupt
+    assert "Your plan" in res.text
+
+
+def test_explicit_replan_regenerates_and_reconfirms():
+    go = _plannable()
+    _lock(go)
+    res = go.start("replan my day", thread_id="lk")
+    assert res.status == "interrupted" and res.interrupt["type"] == "plan_approval"
+
+
+# -- recall branch + planning-log ingestion ----------------------------------
+
+
+def test_recall_intent_routes_to_the_rag_agent():
+    class _FakeRag:
+        def run(self, query):
+            return f"recalled: {query}"
+
+    go = build_graph_orchestrator(tools=[], model_name="dummy", use_llm=False, rag_agent=_FakeRag())
+    out = go.run("what do I usually defer when busy?")
+    assert out.startswith("recalled:")
+
+
+def test_locking_a_plan_writes_a_planning_log():
+    writes = []
+    go = build_graph_orchestrator(
+        tools=[], model_name="dummy", use_llm=False,
+        workday=Workday(start="09:00", end="18:00"),
+        memory_writer=lambda text, source_type: writes.append((source_type, text)),
+    )
+    go.start("plan my day", thread_id="ml", date="2026-06-17")
+    go.resume("ml", {"action": "accept"})
+    assert writes and writes[0][0] == "planning_log"
+    assert "scheduled" in writes[0][1].lower()
+
+
 # -- deterministic CRUD path (validate → confirm → execute → re-plan) ---------
 
 

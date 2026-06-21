@@ -65,6 +65,7 @@ class Intent(str, Enum):
     update = "update"
     delete = "delete"
     weather = "weather"
+    recall = "recall"
     unknown = "unknown"
 
 
@@ -99,6 +100,10 @@ _INTENT_KEYWORDS: list[tuple[Intent, tuple[str, ...]]] = [
                       "list", "show me", "what do i have", "overview")),
     (Intent.weather, ("weather", "forecast", "temperature", "how hot",
                       "how cold", "is it raining", "will it rain")),
+    (Intent.recall, ("recall", "what do i usually", "according to my notes",
+                     "remember when", "from my notes", "from my logs",
+                     "my notes say", "what does my", "in my documents",
+                     "based on my history", "what did i do")),
 ]
 
 

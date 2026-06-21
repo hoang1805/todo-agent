@@ -58,7 +58,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Annotated, Any, NotRequired, TYPE_CHECKING, TypedDict
+from typing import Annotated, Any, Callable, NotRequired, TYPE_CHECKING, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage  # noqa: TC002 — runtime use
 from langchain_core.tools import StructuredTool
@@ -89,18 +89,21 @@ from agents.planner_agent import (
     DEFAULT_WORKDAY,
     Planner,
     Workday,
+    apply_mutation_to_plan,
     format_plan,
     parse_appointment,
     parse_workday,
+    wants_replan,
     workday_with_appointments,
 )
 from pydantic import ValidationError
 
+from agents.rag_agent import RAGAgent, make_rag_agent
 from agents.todo_agent import ContractError, MutationParser, TodoAgent
 from core.services.checkpoint import make_checkpointer_opener
 from core.services.prompts import load_prompt
 from core.tools.common_tools import make_common_tools
-from models.contract import CrudOp, TaskList, TaskMutation
+from models.contract import CrudOp, DayPlan, TaskList, TaskMutation
 
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
@@ -156,6 +159,17 @@ def _trace_node(name: str, fn):
     return wrapped
 
 
+def _plan_summary(plan: DayPlan, date: str | None) -> str:
+    """A short planning-log line written to memory when a plan is locked."""
+    when = date or "today"
+    deferred = ", ".join(t.title for t in plan.deferred) or "nothing"
+    return (
+        f"On {when}: scheduled {len(plan.blocks)} task(s) into "
+        f"{plan.available_minutes} working minutes; deferred {len(plan.deferred)} "
+        f"({deferred})."
+    )
+
+
 def _describe_mutation(mutation: TaskMutation) -> str:
     """A one-line, human-readable summary of a proposed change (for approval)."""
     if mutation.op is CrudOp.create:
@@ -190,6 +204,13 @@ class PlannerState(TypedDict):
     # so "replan today" keeps honoring them (see `run_planner`).
     appointments: NotRequired[list[dict]]
     work_hours: NotRequired[dict | None]
+    # The accepted plan (a DayPlan JSON dict). Persists across turns (NOT reset),
+    # so once locked, task changes patch it in place instead of re-planning.
+    locked_plan: NotRequired[dict | None]
+    # A reject suggestion fed back into the planner during the confirm loop.
+    plan_feedback: NotRequired[str]
+    # The freshly generated plan awaiting confirmation (becomes locked_plan on accept).
+    pending_plan: NotRequired[dict | None]
     approved: NotRequired[bool]  # set by the confirm node from the user's decision
     notice: NotRequired[str]     # success line prepended to the re-planned result
     # `add_messages` makes this an append-only log — the agent⇄tools loop's memory.
@@ -222,6 +243,9 @@ def build_graph_orchestrator(
     mutation_parser: MutationParser | None = None,
     mutation_executor: MutationExecutor | None = None,
     planner: Planner | None = None,
+    memory_tools: list[BaseTool] | None = None,
+    rag_agent: RAGAgent | None = None,
+    memory_writer: "Callable[[str, str], None] | None" = None,
     observe: bool = False,
 ):
     """Wire and compile the LangGraph orchestrator.
@@ -239,6 +263,13 @@ def build_graph_orchestrator(
     mutation_parser = mutation_parser or make_mutation_parser(model_name, temperature, use_llm)
     mutation_executor = mutation_executor or make_mutation_executor(tools)
     planner = planner or make_planner(model_name, temperature, use_llm)
+    # Memory tools (retrieve_*/remember) arrive in the same combined `tools` list,
+    # so default to it; the retriever/writer pick the right tools by name.
+    memory_tools = tools if memory_tools is None else memory_tools
+    rag_agent = rag_agent or make_rag_agent(memory_tools, model_name, temperature, use_llm)
+    if memory_writer is None:
+        from agents.rag_agent import make_memory_writer
+        memory_writer = make_memory_writer(memory_tools)
     todo_agent = TodoAgent(
         fetch_raw=make_mcp_fetcher(tools),
         normalize=make_normalizer(model_name, temperature, use_llm),
@@ -359,12 +390,17 @@ def build_graph_orchestrator(
         }
 
     def run_planner(state: PlannerState) -> dict:
+        # A reject suggestion (confirm loop) is folded into the text we parse hours
+        # and any new fixed-time commitment from — e.g. "actually I can work to 11pm".
+        feedback = state.get("plan_feedback") or ""
+        text = f"{state['user_input']} {feedback}".strip()
+
         # Working hours: parse from the prompt only when the user is explicitly
         # planning ("I work from 7am to 11pm") — otherwise a time range in the
         # text is an appointment, not the day window. Reuse the last hours so
         # "replan today" keeps them; fall back to the configured workday.
         work_hours = state.get("work_hours")
-        parsed = parse_workday(state["user_input"]) if state.get("intent") == "plan" else None
+        parsed = parse_workday(text) if (state.get("intent") == "plan" or feedback) else None
         if parsed is not None:
             wd = parsed
             work_hours = {"start": parsed.start, "end": parsed.end}
@@ -372,13 +408,74 @@ def build_graph_orchestrator(
             wd = Workday(start=work_hours["start"], end=work_hours["end"], breaks=workday.breaks)
         else:
             wd = workday
-        # Fold in any fixed-time commitments, then plan (LLM + safe fallback).
-        wd = workday_with_appointments(wd, state.get("appointments") or [])
+
+        # A suggestion may also add a fixed-time commitment to schedule around.
+        appointments = list(state.get("appointments") or [])
+        if feedback and (appt := parse_appointment(feedback)) is not None:
+            entry = {"name": appt.name, "start": appt.start, "end": appt.end}
+            if entry not in appointments:
+                appointments.append(entry)
+
+        # Fold in fixed-time commitments, then plan (LLM + safe fallback).
+        wd = workday_with_appointments(wd, appointments)
         plan = planner(TaskList.model_validate(state["tasks"]), wd, state.get("date"))
-        out: dict = {"result": format_plan(plan)}
+        out: dict = {
+            "result": format_plan(plan),
+            "pending_plan": plan.model_dump(mode="json"),
+        }
         if work_hours:
             out["work_hours"] = work_hours
+        if appointments != (state.get("appointments") or []):
+            out["appointments"] = appointments
         return out
+
+    def show_locked(state: PlannerState) -> dict:
+        """Render the already-locked plan without re-planning."""
+        return {"result": format_plan(DayPlan.model_validate(state["locked_plan"]))}
+
+    def confirm_plan(state: PlannerState) -> dict:
+        """Pause for the user to accept the plan, or reject with a suggestion.
+
+        Accept → lock the plan for the day. Reject → fold the suggestion back in
+        and re-plan (the confirm loop re-enters this node).
+        """
+        decision = interrupt(
+            {
+                "type": "plan_approval",
+                "plan": state.get("result", ""),
+                "message": "Accept this plan for today?",
+            }
+        )
+        action = decision.get("action") if isinstance(decision, dict) else decision
+        if action == "accept":
+            plan_dict = state.get("pending_plan")
+            # Ingestion (RAG): a locked plan writes a planning_log summary to memory,
+            # creating the feedback loop between the planner and the recall agent.
+            if memory_writer and plan_dict:
+                try:
+                    memory_writer(
+                        _plan_summary(DayPlan.model_validate(plan_dict), state.get("date")),
+                        "planning_log",
+                    )
+                except Exception as exc:  # noqa: BLE001 — memory is best-effort
+                    logger.warning("planning_log write failed: %s", exc)
+            return {
+                "approved": True,
+                "locked_plan": plan_dict,
+                "result": state.get("result", "") + "\n\n🔒 Plan locked for today.",
+            }
+        suggestion = decision.get("reason") if isinstance(decision, dict) else None
+        return {"approved": False, "plan_feedback": suggestion or ""}
+
+    def apply_to_locked(state: PlannerState) -> dict:
+        """Patch the locked plan with the just-executed change (no re-plan)."""
+        plan = DayPlan.model_validate(state["locked_plan"])
+        mutation = TaskMutation.model_validate(state["mutation"])
+        updated = apply_mutation_to_plan(plan, mutation)
+        return {
+            "locked_plan": updated.model_dump(mode="json"),
+            "result": format_plan(updated),  # finalize prepends the ✅ notice
+        }
 
     def run_summary(state: PlannerState) -> dict:
         return {"result": format_summary(TaskList.model_validate(state["tasks"]))}
@@ -393,6 +490,10 @@ def build_graph_orchestrator(
         if task is not None:
             out["focus_task"] = {"id": task.id, "title": task.title}
         return out
+
+    def run_rag(state: PlannerState) -> dict:
+        """The 'recall' branch — the RAGAgent retrieves + reasons over memory."""
+        return {"result": rag_agent.run(state["user_input"])}
 
     # -- CRUD path: validate (contract checkpoint) → confirm → execute → replan --
 
@@ -502,10 +603,17 @@ def build_graph_orchestrator(
         intent = state["intent"]
         if intent == "appointment":
             return "appointment"
-        if intent in ("plan", "summary", "detail"):
+        if intent == "plan":
+            # A locked plan is shown as-is unless the user asks to "replan".
+            if state.get("locked_plan") and not wants_replan(state["user_input"]):
+                return "show_locked"
+            return "todo"
+        if intent in ("summary", "detail"):
             return "todo"
         if intent in ("add", "update", "delete"):
             return "crud"
+        if intent == "recall":
+            return "rag"  # the one new branch for the memory/RAG agent
         return "agent"
 
     def route_after_todo(state: PlannerState) -> str:
@@ -519,6 +627,15 @@ def build_graph_orchestrator(
             return "detail"
         return "planner"
 
+    def route_after_planner(state: PlannerState) -> str:
+        # A freshly (re)generated plan from an explicit plan/appointment request is
+        # confirmed (accept → lock); CRUD-triggered re-plans (unlocked) just show.
+        return "confirm_plan" if state["intent"] in ("plan", "appointment") else "finalize"
+
+    def route_after_confirm_plan(state: PlannerState) -> str:
+        # accept → done; reject → re-plan with the suggestion (the confirm loop).
+        return "finalize" if state.get("approved") else "planner"
+
     def route_after_extract(state: PlannerState) -> str:
         return "finalize" if state.get("error") else "confirm_mutation"
 
@@ -526,7 +643,10 @@ def build_graph_orchestrator(
         return "execute_mutation" if state.get("approved") else "finalize"
 
     def route_after_execute(state: PlannerState) -> str:
-        return "finalize" if state.get("error") else "todo"  # success → re-plan
+        if state.get("error"):
+            return "finalize"
+        # Locked plan → patch it in place; otherwise re-plan (unlocked).
+        return "apply_to_locked" if state.get("locked_plan") else "todo"
 
     def should_continue(state: PlannerState) -> str:
         last = state["messages"][-1]
@@ -541,8 +661,12 @@ def build_graph_orchestrator(
     g.add_node("classify", node("classify", classify))
     g.add_node("todo", node("todo", run_todo))
     g.add_node("planner", node("planner", run_planner))
+    g.add_node("confirm_plan", node("confirm_plan", confirm_plan))
+    g.add_node("show_locked", node("show_locked", show_locked))
+    g.add_node("apply_to_locked", node("apply_to_locked", apply_to_locked))
     g.add_node("summary", node("summary", run_summary))
     g.add_node("detail", node("detail", run_detail))
+    g.add_node("rag", node("rag", run_rag))
     g.add_node("register_appointment", node("register_appointment", register_appointment))
     g.add_node("extract_mutation", node("extract_mutation", extract_mutation))
     g.add_node("confirm_mutation", node("confirm_mutation", confirm_mutation))
@@ -555,13 +679,22 @@ def build_graph_orchestrator(
     g.add_conditional_edges(
         "classify", route_by_intent,
         {"todo": "todo", "crud": "extract_mutation", "agent": "agent",
-         "appointment": "register_appointment"},
+         "appointment": "register_appointment", "show_locked": "show_locked",
+         "rag": "rag"},
     )
     g.add_edge("register_appointment", "todo")  # register, then re-plan the day
     g.add_conditional_edges(
         "todo", route_after_todo,
         {"planner": "planner", "summary": "summary", "detail": "detail",
          "finalize": "finalize"},
+    )
+    g.add_conditional_edges(
+        "planner", route_after_planner,
+        {"confirm_plan": "confirm_plan", "finalize": "finalize"},
+    )
+    g.add_conditional_edges(
+        "confirm_plan", route_after_confirm_plan,
+        {"finalize": "finalize", "planner": "planner"},  # reject → re-plan loop
     )
     g.add_conditional_edges(
         "extract_mutation", route_after_extract,
@@ -573,11 +706,13 @@ def build_graph_orchestrator(
     )
     g.add_conditional_edges(
         "execute_mutation", route_after_execute,
-        {"todo": "todo", "finalize": "finalize"},
+        {"todo": "todo", "apply_to_locked": "apply_to_locked", "finalize": "finalize"},
     )
-    g.add_edge("planner", "finalize")
+    g.add_edge("show_locked", "finalize")
+    g.add_edge("apply_to_locked", "finalize")
     g.add_edge("summary", "finalize")
     g.add_edge("detail", "finalize")
+    g.add_edge("rag", "finalize")
     g.add_conditional_edges(
         "agent", should_continue, {"tools": "tools", "finalize": "finalize"}
     )
@@ -689,6 +824,9 @@ class GraphOrchestrator:
                     "notice": "",
                     "result": "",
                     "error": "",
+                    # Plan confirm-loop scratch (locked_plan persists, so it's NOT reset).
+                    "plan_feedback": "",
+                    "pending_plan": None,
                 },
                 thread_id,
             )
@@ -722,6 +860,11 @@ class GraphOrchestrator:
         """
         result = self.start(user_input, date)
         if result.status == "interrupted":
-            msg = (result.interrupt or {}).get("message", "Approval required.")
-            return f"[approval needed] {msg}"
+            intr = result.interrupt or {}
+            # No human in this non-interactive path: auto-accept a plan
+            # confirmation (returns the locked plan), but never auto-approve a
+            # data mutation — those still require explicit start()/resume().
+            if intr.get("type") == "plan_approval":
+                return self.resume(result.thread_id, {"action": "accept"}).text
+            return f"[approval needed] {intr.get('message', 'Approval required.')}"
         return result.text

@@ -80,6 +80,12 @@ Orchestrator → formatted, time-blocked day
   gates its mutating tools, via [`agents/human_in_the_loop.py`](src/agents/human_in_the_loop.py).)
   Create/update can set any task field — title, description, priority, status,
   **estimated minutes**, **category** (work/home/health/…), and due date.
+- **Plans are confirmed, then locked.** A generated plan pauses for the user to **Accept** (lock
+  it for the day) or **Reject** with a suggestion (re-plan with it folded in — the confirm loop).
+  Once locked, task changes patch the locked plan **in place** — marking a task done annotates it
+  (`✅ ~~title~~`), no re-schedule; the plan is only regenerated on an explicit "replan".
+  See `confirm_plan`/`show_locked`/`apply_to_locked` and `apply_mutation_to_plan`
+  ([agents/planner_agent.py](src/agents/planner_agent.py)).
 - **Approvals survive restarts.** The graph is compiled with a **persistent SQLite checkpointer**
   ([`core/services/checkpoint.py`](src/core/services/checkpoint.py)), so a pending approval — and the
   conversation thread — can be resumed even after the process restarts. It falls back to an in-memory
@@ -101,6 +107,15 @@ Orchestrator → formatted, time-blocked day
   iteration ([`prompts/complex_agent_system.md`](src/prompts/complex_agent_system.md) tells it to handle
   every part). A prompt that matches more than one intent family (or a non-task one like weather) is
   routed here automatically; single `plan`/`summary`/CRUD requests stay on the loop-free deterministic path.
+- **Recall is an agentic RAG branch (the third agent).** A `recall` intent ("what do I usually
+  defer when busy?", "what does my reference doc say…?") routes to a **`rag`** node backing the
+  [`RAGAgent`](src/agents/rag_agent.py): a real **retrieve → judge → generate loop** (not one
+  pass) that picks `retrieve_log` vs `retrieve_document`, validates each result against
+  `DataChunk`, judges sufficiency (structured `RetrievalDecision`, with a heuristic fallback), and
+  **reformulates + retries** up to `MAX_ITERATIONS` before answering grounded only in what it found.
+  The data lives behind a separate **[memory MCP server](../mcps/memory-mcp)**; locking a plan
+  auto-writes a `planning_log` summary there (the planner↔recall feedback loop). Adding this agent
+  was **one** new branch in the graph (`route_by_intent` → `rag`) — the hub-and-spoke property.
 - **The agent knows its tools.** The loop's system prompt is built from the live tool set (name +
   one-line description for every bound tool), so the model is told exactly what it can call.
 - **Graceful degradation.** With the MCP server down it uses sample tasks; with Ollama down it uses

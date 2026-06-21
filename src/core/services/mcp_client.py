@@ -7,8 +7,12 @@ LangChain-compatible tools from every connected server.
 
 from __future__ import annotations
 
+import logging
+
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+
+logger = logging.getLogger(__name__)
 
 
 def build_mcp_client(servers: dict[str, str]) -> MultiServerMCPClient:
@@ -31,16 +35,23 @@ def build_mcp_client(servers: dict[str, str]) -> MultiServerMCPClient:
 
 
 async def get_mcp_tools(servers: dict[str, str]) -> list[BaseTool]:
-    """Connect to all MCP servers and return a flat list of LangChain tools.
+    """Connect to the MCP servers and return a flat list of LangChain tools.
 
-    Each server connection is opened on demand (no persistent session).
+    Servers are loaded **independently** so one being down (e.g. the optional
+    memory server) contributes no tools instead of failing the whole load — the
+    task tools still come through.
 
     Args:
         servers: Mapping of server name → SSE endpoint URL.
 
     Returns:
-        All tools exposed by all servers, as LangChain ``BaseTool`` objects.
+        All tools exposed by the reachable servers, as ``BaseTool`` objects.
     """
-    client = build_mcp_client(servers)
-    tools: list[BaseTool] = await client.get_tools()
+    tools: list[BaseTool] = []
+    for name, url in servers.items():
+        try:
+            client = build_mcp_client({name: url})
+            tools += await client.get_tools()
+        except Exception as exc:  # noqa: BLE001 — skip an unreachable server
+            logger.warning("MCP server %r unavailable (%s); skipping its tools.", name, exc)
     return tools

@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable
 
+from pydantic import BaseModel
+
 from models.contract import (
     CrudOp,
     DayPlan,
@@ -72,12 +74,14 @@ class Workday:
 DEFAULT_WORKDAY = Workday()
 
 
-# A time like "7", "7:30", "7h30", "7am", "11 pm" — hour, optional minutes
-# (``:`` or ``h`` separator), optional am/pm.
-_TIME = r"(\d{1,2})(?:[:h](\d{2}))?\s*([ap]\.?m\.?)?"
-# A range: "<time> to/until/till/through/- <time>" (e.g. "from 7am to 11pm").
+# A time like "7", "7:30", "7h30", "7.30", "7h" (= 7:00), "7am", "11 pm" — hour,
+# optional minutes (``:``, ``h`` or ``.`` separator) or a bare ``h``, optional am/pm.
+_TIME = r"(\d{1,2})(?:[:h.](\d{2})|h)?\s*([ap]\.?m\.?)?"
+# A range: "<time> to/until/till/through/into/- <time>" (e.g. "from 7am to 11pm",
+# "11am into 1.30pm"). Longer connectors are listed before their prefixes so the
+# alternation prefers the full word ("till" over "til", "through" over "thru").
 _RANGE_RE = re.compile(
-    rf"{_TIME}\s*(-|–|—|to|until|till|through)\s*{_TIME}", re.IGNORECASE
+    rf"{_TIME}\s*(-|–|—|to|until|till|til|through|thru|into)\s*{_TIME}", re.IGNORECASE
 )
 
 
@@ -166,7 +170,8 @@ _LABEL_LEADIN_RE = re.compile(
 def _appointment_label(text: str, upto: int) -> str:
     """Derive an event name from the words before the time range (best-effort)."""
     head = text[:upto].strip()
-    head = re.sub(r"\b(from|at|on|starting|between|@)\s*$", "", head, flags=re.I).strip()
+    # Strip trailing lead-in words, repeated ("lunch from from " → "lunch").
+    head = re.sub(r"(?:\b(?:from|at|on|starting|between|@)\b\s*)+$", "", head, flags=re.I).strip()
     head = _LABEL_LEADIN_RE.sub("", head).strip(" ,.-—–")
     if not head:
         return "Appointment"
@@ -193,6 +198,140 @@ def parse_appointment(text: str) -> Break | None:
         return None
     start, end = rng
     return Break(name=_appointment_label(text, match.start()), start=start, end=end)
+
+
+# --- LLM appointment extraction (robust to phrasing; regex is the fallback) ---
+
+# A clock time: "13:30", "13h30", "1.30", "11h", "3pm", "11 am", or a worded time.
+# Note: a bare number ("task 5") is deliberately NOT a cue.
+_CLOCK_RE = re.compile(
+    r"\b\d{1,2}\s*[:h.]\s*\d{2}\b"        # 13:30 / 13h30 / 1.30
+    r"|\b\d{1,2}\s*h\b"                    # 11h
+    r"|\b\d{1,2}\s*[ap]\.?m\.?\b"          # 3pm / 11 am
+    r"|\bnoon\b|\bmidday\b|\bmidnight\b|o'?clock",
+    re.IGNORECASE,
+)
+
+
+def _has_time_cue(text: str) -> bool:
+    """Cheap gate: does the text actually mention a *time* (a clock time or a time
+    range)? Skips the LLM call for prompts that can't carry a fixed-time
+    commitment ('plan my day', 'delete task 5')."""
+    text = text or ""
+    return bool(_CLOCK_RE.search(text) or _RANGE_RE.search(text))
+
+
+def _norm_hhmm(value: str | None) -> str | None:
+    """Validate/normalize an ``HH:MM`` (24-hour) string, or ``None`` if malformed."""
+    if not value:
+        return None
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", str(value))
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    return f"{hour:02d}:{minute:02d}" if 0 <= hour <= 23 and 0 <= minute <= 59 else None
+
+
+class AppointmentExtraction(BaseModel):
+    """Structured LLM result: one fixed-time commitment (or none)."""
+
+    is_appointment: bool
+    # Nullable: the model often returns ``"name": null`` for non-appointments; a
+    # plain ``str`` default would reject that. Coerced to "Appointment" on use.
+    name: str | None = "Appointment"
+    start: str | None = None  # "HH:MM", 24-hour
+    end: str | None = None    # "HH:MM", 24-hour
+
+
+def llm_extract_appointment(text: str, model_name: str, temperature: float = 0.0) -> Break | None:
+    """Extract a single fixed-time commitment from free text via structured output.
+
+    Returns a validated :class:`Break`, or ``None`` when the text isn't an
+    appointment (or the model says so). Raises on an LLM/parse error so the caller
+    (:func:`~agents.orchestrator.make_appointment_parser`) can fall back to the
+    regex :func:`parse_appointment`. The schema is generated *from*
+    :class:`AppointmentExtraction`, the same structured-output discipline as the
+    planner and judge.
+    """
+    if not _has_time_cue(text):
+        return None
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from agents.todo_agent import _loads_jsonish
+    from core.services.llm_client import create_ollama_model
+    from core.services.prompts import load_prompt
+
+    schema = AppointmentExtraction.model_json_schema()
+    llm = create_ollama_model(model_name, temperature, format=schema, with_thinking=False)
+    response = llm.invoke([
+        SystemMessage(content=load_prompt("appointment_extractor_system")),
+        HumanMessage(content=text),
+    ])
+    data = _loads_jsonish(response.content)
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    parsed = AppointmentExtraction.model_validate(data)
+    if not parsed.is_appointment:
+        return None
+    start, end = _norm_hhmm(parsed.start), _norm_hhmm(parsed.end)
+    if not start or not end or end <= start:
+        return None
+    return Break(name=(parsed.name or "Appointment").strip() or "Appointment", start=start, end=end)
+
+
+# --- "What's scheduled at <time>?" — a lookup against an existing plan ---
+
+_AT_TIME_QUERY_RE = re.compile(
+    r"\b(what|what's|whats|which|when|any|is there|do i have)\b", re.IGNORECASE
+)
+
+
+def asks_about_time(text: str) -> bool:
+    """True if the prompt asks what's scheduled at a specific clock time
+    ("which task do I have at 7pm?") — a question word plus a real time."""
+    text = text or ""
+    return bool(_AT_TIME_QUERY_RE.search(text)) and bool(_CLOCK_RE.search(text))
+
+
+def parse_query_time(text: str) -> str | None:
+    """Pull a single clock time out of a question, as ``HH:MM`` (or ``None``).
+
+    Skips bare numbers ("task 5"): only a token with am/pm, minutes, or an ``h``
+    suffix counts as a time.
+    """
+    for match in re.finditer(_TIME, text or "", re.IGNORECASE):
+        hour, minute, ampm = match.groups()
+        token = match.group(0).lower()
+        if not (ampm or minute or "h" in token):
+            continue
+        parsed = _to_24h(hour, minute, ampm)
+        if parsed:
+            return parsed
+    return None
+
+
+def describe_plan_at_time(plan: DayPlan, when: str) -> str:
+    """Answer "what's at <when>?" from *plan* — the task/break covering that time,
+    or the next thing up if that slot is free."""
+    t = _t(when)
+    for block in plan.blocks:
+        if _t(block.start) <= t < _t(block.end):
+            emoji = PRIORITY_EMOJI.get(block.priority.value, "")
+            return f"At {when} you're scheduled to: {emoji} {block.title} ({block.start}–{block.end})."
+    for brk in plan.breaks:
+        if _t(brk.start) <= t < _t(brk.end):
+            return f"At {when} you have {brk.name} ({brk.start}–{brk.end})."
+    # Free at that time — point to the next thing up (a task or a meal), if any.
+    upcoming = sorted(
+        [(b.start, b.title) for b in plan.blocks if _t(b.start) >= t]
+        + [(br.start, br.name) for br in plan.breaks if _t(br.start) >= t],
+        key=lambda item: _t(item[0]),
+    )
+    if upcoming:
+        start, label = upcoming[0]
+        return f"Nothing is scheduled at {when}. Next up is {label} at {start}."
+    return f"Nothing is scheduled at {when} — your plan has nothing then."
 
 
 def workday_with_appointments(workday: Workday, appointments: list[dict]) -> Workday:
@@ -534,6 +673,15 @@ def llm_plan_day(
 # ---------------------------------------------------------------------------
 
 
+_MEAL_WORDS = ("lunch", "dinner", "breakfast", "brunch", "supper", "meal")
+
+
+def _break_emoji(name: str) -> str:
+    """🍽️ for meals, 📌 for any other fixed-time commitment (a meeting isn't eating)."""
+    low = (name or "").lower()
+    return "🍽️" if any(word in low for word in _MEAL_WORDS) else "📌"
+
+
 def format_plan(plan: DayPlan) -> str:
     """Render a :class:`DayPlan` as readable text without an LLM."""
     header = f"🗓️  Your plan{f' for {plan.date}' if plan.date else ''}"
@@ -558,7 +706,7 @@ def format_plan(plan: DayPlan) -> str:
                         f"{item.title} ({item.est_minutes} min)"
                     )
             else:
-                lines.append(f"  {item.start}–{item.end}  🍽️ {item.name}")
+                lines.append(f"  {item.start}–{item.end}  {_break_emoji(item.name)} {item.name}")
     else:
         lines.append("  (nothing scheduled)")
 

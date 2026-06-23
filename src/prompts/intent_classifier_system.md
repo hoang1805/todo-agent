@@ -18,7 +18,18 @@ with no punctuation or extra text:
   dentist appointment", "drop the figma task").
 - `weather` — asks about the weather or forecast (e.g. "will it rain today",
   "how hot is it").
-- `unknown` — anything else (greetings, small talk, unrelated questions).
+- `recall` — wants an answer to an informational or factual question, rather than
+  acting on their task list. This covers questions about their own planning history
+  or ingested documents ("what do I usually defer when I'm busy", "what does my
+  reference doc say about deploys", "according to my notes, when are core hours")
+  **and** bare factual questions whose answer could plausibly live in those
+  documents ("how far ahead must I book international flights", "what's the code
+  review policy", "when are core hours"). When you are unsure between `recall` and
+  `unknown` for a genuine question, prefer `recall` — the retrieval step answers
+  from memory or honestly reports finding nothing.
+- `unknown` — greetings, small talk, meta-questions about the assistant itself, or
+  requests that fit none of the categories above. Do **not** use this for a genuine
+  information request — that is `recall`.
 
 Pick the single best fit. If the message asks to both view and change tasks,
 prefer the change (`add`/`update`/`delete`). Output only the single word.

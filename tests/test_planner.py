@@ -6,6 +6,8 @@ from agents.planner_agent import (
     Workday,
     apply_mutation_to_plan,
     format_plan,
+    parse_appointment,
+    parse_workday,
     plan_day,
     rank_tasks,
     wants_replan,
@@ -139,6 +141,74 @@ def _two_task_plan():
         Task(id="2", title="Call bank", priority="low", est_minutes=30, category="errand"),
     ])
     return plan_day(tasks, workday=NO_BREAKS)
+
+
+def test_parse_appointment_accepts_into_connector_and_dot_minutes():
+    # Regression: "into" wasn't a recognized connector and "." wasn't a minute
+    # separator, so this common phrasing parsed to None (no appointment registered).
+    appt = parse_appointment("i have lunch with my friend from 11am into 1.30pm")
+    assert appt is not None
+    assert (appt.start, appt.end) == ("11:00", "13:30")
+    assert appt.name == "Lunch with my friend"
+
+
+def test_parse_workday_ignores_a_fixed_time_event():
+    # The day window must not be derived from an appointment's time range.
+    assert parse_appointment("dinner from 17:30 to 19:30") is not None
+    # parse_workday still reads an explicit work range…
+    assert parse_workday("I work 8am to 10pm").end == "22:00"
+
+
+def test_asks_about_time_distinguishes_questions_from_statements():
+    from agents.planner_agent import asks_about_time, parse_query_time
+
+    assert asks_about_time("which task do I have at 7pm?")
+    assert asks_about_time("what's on at 13:30")
+    assert not asks_about_time("i have lunch at 7pm")   # a statement, not a question
+    assert not asks_about_time("plan my day")           # no time
+    assert parse_query_time("which task at 7pm") == "19:00"
+    assert parse_query_time("plan my day") is None      # no clock time
+
+
+def test_describe_plan_at_time_finds_block_break_and_next_up():
+    from agents.planner_agent import Workday, describe_plan_at_time, plan_day
+
+    plan = plan_day(_tl(("a", "high", 120), ("b", "low", 45)),
+                    Workday(start="09:00", end="20:00"))
+    # 09:00–11:00 is task a; 11:00–11:45 is task b; 12:00–13:00 is the Lunch break.
+    assert "task-a" in describe_plan_at_time(plan, "10:00")
+    assert "Lunch" in describe_plan_at_time(plan, "12:30")
+    # 11:45–12:00 is a free gap → point at the next thing up (the Lunch break).
+    assert "Next up" in describe_plan_at_time(plan, "11:50")
+
+
+def test_appointment_extraction_accepts_null_name():
+    from agents.planner_agent import AppointmentExtraction
+
+    # The model commonly returns {"is_appointment": false, "name": null}; that
+    # must validate (regression — a plain `str` field rejected it).
+    parsed = AppointmentExtraction.model_validate({"is_appointment": False, "name": None})
+    assert parsed.is_appointment is False
+
+
+def test_appointment_parser_is_the_regex_without_llm():
+    from agents.orchestrator import make_appointment_parser
+
+    parse = make_appointment_parser("dummy", 0.0, use_llm=False)
+    assert parse("dinner from 17:30 to 19:30") is not None
+    assert parse("plan my day") is None
+
+
+def test_appointment_parser_falls_back_to_regex_when_llm_errors(monkeypatch):
+    import agents.orchestrator as orch
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("ollama down")
+
+    monkeypatch.setattr(orch, "llm_extract_appointment", boom)
+    parse = orch.make_appointment_parser("dummy", 0.0, use_llm=True)
+    appt = parse("i have lunch from 11h to 13h30")  # regex fallback still parses it
+    assert appt is not None and (appt.start, appt.end) == ("11:00", "13:30")
 
 
 def test_wants_replan_detects_explicit_regenerate():

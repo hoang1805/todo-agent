@@ -27,11 +27,14 @@ from pydantic import ValidationError
 from agents.planner_agent import (
     DEFAULT_WORKDAY,
     PRIORITY_EMOJI,
+    Break,
     DailyPlannerAgent,
     Planner,
     Workday,
     format_plan,
+    llm_extract_appointment,
     llm_plan_day,
+    parse_appointment,
     plan_day,
 )
 from agents.todo_agent import (
@@ -60,6 +63,7 @@ class Intent(str, Enum):
     plan = "plan"
     summary = "summary"
     detail = "detail"
+    at_time = "at_time"  # "which task do I have at 7pm?" — look up the plan at a time
     appointment = "appointment"
     add = "add"
     update = "update"
@@ -466,6 +470,34 @@ def make_planner(
         return plan_day(tasks, workday=workday, date=date)
 
     return plan
+
+
+def make_appointment_parser(
+    model_name: str, temperature: float, use_llm: bool
+) -> "Callable[[str], Break | None]":
+    """Build an appointment detector: LLM extraction with the regex as fallback.
+
+    Mirrors :func:`make_planner` / :func:`make_normalizer` — prefer the model
+    (robust to natural phrasing like "11h to 13h30" or "lunch at noon for 2h"),
+    but degrade to the deterministic :func:`parse_appointment` when Ollama is
+    unavailable, so the planner still works offline. With ``use_llm`` off it *is*
+    the regex. The LLM path self-gates on a cheap time cue, so it spends no model
+    call on prompts that can't contain a fixed-time commitment.
+    """
+    if not use_llm:
+        return parse_appointment
+
+    def parse(text: str) -> "Break | None":
+        text = (text or "").strip()
+        if not text:
+            return None
+        try:
+            return llm_extract_appointment(text, model_name, temperature)
+        except Exception as exc:  # noqa: BLE001 — recoverable: fall back to the regex
+            logger.warning("LLM appointment extraction failed (%s); using regex.", exc)
+            return parse_appointment(text)
+
+    return parse
 
 
 def make_mutation_executor(tools: list[BaseTool]) -> MutationExecutor:

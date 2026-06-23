@@ -78,6 +78,7 @@ from agents.orchestrator import (
     is_crud_intent,
     llm_classify_intent,
     wants_detail,
+    make_appointment_parser,
     make_mcp_fetcher,
     make_mutation_executor,
     make_mutation_parser,
@@ -90,8 +91,10 @@ from agents.planner_agent import (
     Planner,
     Workday,
     apply_mutation_to_plan,
+    asks_about_time,
+    describe_plan_at_time,
     format_plan,
-    parse_appointment,
+    parse_query_time,
     parse_workday,
     wants_replan,
     workday_with_appointments,
@@ -199,6 +202,10 @@ class PlannerState(TypedDict):
     # the other per-turn fields it is NOT reset between turns, so a follow-up like
     # "change its category" can resolve to it (see `extract_mutation`).
     focus_task: NotRequired[dict | None]
+    # The appointment detected in this turn's prompt (``{"name", "start", "end"}``),
+    # set by ``classify`` so ``register_appointment`` reuses it without re-parsing
+    # (avoids a second LLM extraction). Reset each turn.
+    detected_appointment: NotRequired[dict | None]
     # Fixed-time commitments for the day, each ``{"name", "start", "end"}``, and
     # the last stated working hours ``{"start", "end"}``. Both persist across turns
     # so "replan today" keeps honoring them (see `run_planner`).
@@ -212,11 +219,17 @@ class PlannerState(TypedDict):
     # The freshly generated plan awaiting confirmation (becomes locked_plan on accept).
     pending_plan: NotRequired[dict | None]
     approved: NotRequired[bool]  # set by the confirm node from the user's decision
+    # The raw confirm decision ("accept" / "reject" / "cancel"), so routing can
+    # tell a reject (→ re-plan) from a cancel (→ just finish). Reset each turn.
+    confirm_action: NotRequired[str]
     notice: NotRequired[str]     # success line prepended to the re-planned result
     # `add_messages` makes this an append-only log — the agent⇄tools loop's memory.
     messages: Annotated[list[AnyMessage], add_messages]
     result: NotRequired[str]
     error: NotRequired[str]
+    # Per-turn, human-readable progress lines (e.g. the RAG loop's retrieve/judge/
+    # reformulate phases). Surfaced live in the UI via streaming; reset each turn.
+    progress: NotRequired[list[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +256,7 @@ def build_graph_orchestrator(
     mutation_parser: MutationParser | None = None,
     mutation_executor: MutationExecutor | None = None,
     planner: Planner | None = None,
+    appointment_parser: "Callable[[str], object] | None" = None,
     memory_tools: list[BaseTool] | None = None,
     rag_agent: RAGAgent | None = None,
     memory_writer: "Callable[[str, str], None] | None" = None,
@@ -263,6 +277,7 @@ def build_graph_orchestrator(
     mutation_parser = mutation_parser or make_mutation_parser(model_name, temperature, use_llm)
     mutation_executor = mutation_executor or make_mutation_executor(tools)
     planner = planner or make_planner(model_name, temperature, use_llm)
+    appointment_parser = appointment_parser or make_appointment_parser(model_name, temperature, use_llm)
     # Memory tools (retrieve_*/remember) arrive in the same combined `tools` list,
     # so default to it; the retriever/writer pick the right tools by name.
     memory_tools = tools if memory_tools is None else memory_tools
@@ -342,16 +357,26 @@ def build_graph_orchestrator(
     def classify(state: PlannerState) -> dict:
         # Echo the user's prompt before any reasoning (for logs/observability).
         logger.info("USER PROMPT: %s", state["user_input"])
-        # A fixed-time commitment ("dinner with family from 17:30 to 19:30") is
-        # registered as an appointment and the day re-planned around it — never
-        # turned into a flexible task.
-        if parse_appointment(state["user_input"]) is not None:
-            return {"intent": "appointment"}
         # "show me the detail of task X" usually also trips a summary keyword
         # ("show me"); detail is the more specific intent, so resolve it first
         # before the multi-family check would mis-route it to the agent loop.
         if wants_detail(state["user_input"]):
             return {"intent": "detail"}
+        # "which task do I have at 7pm?" — a lookup against the plan at a time.
+        # Cheap (regex) and checked before the appointment LLM call so a *question*
+        # about a time isn't mistaken for *stating* a commitment.
+        if asks_about_time(state["user_input"]):
+            return {"intent": "at_time"}
+        # A fixed-time commitment ("dinner with family from 17:30 to 19:30") is
+        # registered as an appointment and the day re-planned around it — never
+        # turned into a flexible task. Parsed once here (LLM with a regex fallback)
+        # and carried in state so `register_appointment` doesn't parse it again.
+        appt = appointment_parser(state["user_input"])
+        if appt is not None:
+            return {
+                "intent": "appointment",
+                "detected_appointment": {"name": appt.name, "start": appt.start, "end": appt.end},
+            }
         # A prompt that touches more than one intent family (e.g. "plan my day
         # AND add a task") is multi-step — send it to the agent loop, which can
         # sequence several tools, instead of a single deterministic path.
@@ -377,30 +402,37 @@ def build_graph_orchestrator(
 
     def register_appointment(state: PlannerState) -> dict:
         """Record a fixed-time commitment so the re-plan schedules around it."""
-        appt = parse_appointment(state["user_input"])
-        if appt is None:  # defensive — classify already gated this
-            return {}
-        entry = {"name": appt.name, "start": appt.start, "end": appt.end}
+        # Reuse what classify already parsed; re-parse only as a defensive fallback.
+        entry = state.get("detected_appointment")
+        if not entry:
+            appt = appointment_parser(state["user_input"])
+            if appt is None:  # defensive — classify already gated this
+                return {}
+            entry = {"name": appt.name, "start": appt.start, "end": appt.end}
         appointments = list(state.get("appointments") or [])
         if entry not in appointments:
             appointments.append(entry)
         return {
             "appointments": appointments,
-            "notice": f"📌 Noted '{appt.name}' from {appt.start} to {appt.end}.",
+            "notice": f"📌 Noted '{entry['name']}' from {entry['start']} to {entry['end']}.",
         }
 
     def run_planner(state: PlannerState) -> dict:
-        # A reject suggestion (confirm loop) is folded into the text we parse hours
-        # and any new fixed-time commitment from — e.g. "actually I can work to 11pm".
+        # A reject suggestion (confirm loop) may be a working-hours change
+        # ("actually I can work to 11pm") OR a fixed-time commitment ("I have lunch
+        # 11am–1:30pm"). Parse the appointment first so its time range is never
+        # mistaken for the day window (which would shrink the day onto the event).
         feedback = state.get("plan_feedback") or ""
-        text = f"{state['user_input']} {feedback}".strip()
+        appt = appointment_parser(feedback) if feedback else None
 
-        # Working hours: parse from the prompt only when the user is explicitly
-        # planning ("I work from 7am to 11pm") — otherwise a time range in the
-        # text is an appointment, not the day window. Reuse the last hours so
-        # "replan today" keeps them; fall back to the configured workday.
+        # Working hours: parse from the prompt when explicitly planning, and from a
+        # reject suggestion only when it isn't a fixed-time event. Reuse the last
+        # hours so "replan today" keeps them; fall back to the configured workday.
         work_hours = state.get("work_hours")
-        parsed = parse_workday(text) if (state.get("intent") == "plan" or feedback) else None
+        hours_text = state["user_input"] if state.get("intent") == "plan" else ""
+        if feedback and appt is None:
+            hours_text = f"{hours_text} {feedback}".strip()
+        parsed = parse_workday(hours_text) if hours_text else None
         if parsed is not None:
             wd = parsed
             work_hours = {"start": parsed.start, "end": parsed.end}
@@ -411,7 +443,7 @@ def build_graph_orchestrator(
 
         # A suggestion may also add a fixed-time commitment to schedule around.
         appointments = list(state.get("appointments") or [])
-        if feedback and (appt := parse_appointment(feedback)) is not None:
+        if appt is not None:
             entry = {"name": appt.name, "start": appt.start, "end": appt.end}
             if entry not in appointments:
                 appointments.append(entry)
@@ -461,11 +493,20 @@ def build_graph_orchestrator(
                     logger.warning("planning_log write failed: %s", exc)
             return {
                 "approved": True,
+                "confirm_action": "accept",
                 "locked_plan": plan_dict,
                 "result": state.get("result", "") + "\n\n🔒 Plan locked for today.",
             }
+        if action == "cancel":
+            # Drop this proposal without locking it and without re-planning.
+            return {
+                "approved": False,
+                "confirm_action": "cancel",
+                "plan_feedback": "",
+                "result": "🚫 Plan discarded — nothing was locked. Ask me to plan again whenever you like.",
+            }
         suggestion = decision.get("reason") if isinstance(decision, dict) else None
-        return {"approved": False, "plan_feedback": suggestion or ""}
+        return {"approved": False, "confirm_action": "reject", "plan_feedback": suggestion or ""}
 
     def apply_to_locked(state: PlannerState) -> dict:
         """Patch the locked plan with the just-executed change (no re-plan)."""
@@ -491,9 +532,40 @@ def build_graph_orchestrator(
             out["focus_task"] = {"id": task.id, "title": task.title}
         return out
 
+    def run_at_time(state: PlannerState) -> dict:
+        """Answer "which task do I have at <time>?" against the plan.
+
+        Prefers the locked (or just-proposed) plan; if there isn't one yet, it
+        builds a plan to answer against — honoring any stated hours/appointments —
+        without locking it.
+        """
+        when = parse_query_time(state["user_input"])
+        if when is None:
+            return {"result": "Which time do you mean? e.g. \"what's scheduled at 7pm?\""}
+        plan_dict = state.get("locked_plan") or state.get("pending_plan")
+        if plan_dict:
+            plan = DayPlan.model_validate(plan_dict)
+        else:
+            try:
+                tasks = todo_agent.run()
+            except ContractError as exc:
+                logger.error("Contract failed: %s", exc.errors)
+                return {"result": _CONTRACT_ERROR_MSG}
+            wh = state.get("work_hours")
+            wd = Workday(start=wh["start"], end=wh["end"], breaks=workday.breaks) if wh else workday
+            wd = workday_with_appointments(wd, list(state.get("appointments") or []))
+            plan = planner(tasks, wd, state.get("date"))
+        return {"result": describe_plan_at_time(plan, when)}
+
     def run_rag(state: PlannerState) -> dict:
-        """The 'recall' branch — the RAGAgent retrieves + reasons over memory."""
-        return {"result": rag_agent.run(state["user_input"])}
+        """The 'recall' branch — the RAGAgent retrieves + reasons over memory.
+
+        The loop's phases are collected into ``progress`` so the streaming UI can
+        show what the recall agent actually did (which sources, reformulations).
+        """
+        steps: list[str] = []
+        answer = rag_agent.run(state["user_input"], on_step=steps.append)
+        return {"result": answer, "progress": steps}
 
     # -- CRUD path: validate (contract checkpoint) → confirm → execute → replan --
 
@@ -610,6 +682,8 @@ def build_graph_orchestrator(
             return "todo"
         if intent in ("summary", "detail"):
             return "todo"
+        if intent == "at_time":
+            return "at_time"  # look up the plan at a time (no todo/planner pipeline)
         if intent in ("add", "update", "delete"):
             return "crud"
         if intent == "recall":
@@ -633,8 +707,11 @@ def build_graph_orchestrator(
         return "confirm_plan" if state["intent"] in ("plan", "appointment") else "finalize"
 
     def route_after_confirm_plan(state: PlannerState) -> str:
-        # accept → done; reject → re-plan with the suggestion (the confirm loop).
-        return "finalize" if state.get("approved") else "planner"
+        # accept → done; cancel → done (discarded); reject → re-plan with the
+        # suggestion (the confirm loop).
+        if state.get("approved"):
+            return "finalize"
+        return "finalize" if state.get("confirm_action") == "cancel" else "planner"
 
     def route_after_extract(state: PlannerState) -> str:
         return "finalize" if state.get("error") else "confirm_mutation"
@@ -666,6 +743,7 @@ def build_graph_orchestrator(
     g.add_node("apply_to_locked", node("apply_to_locked", apply_to_locked))
     g.add_node("summary", node("summary", run_summary))
     g.add_node("detail", node("detail", run_detail))
+    g.add_node("at_time", node("at_time", run_at_time))
     g.add_node("rag", node("rag", run_rag))
     g.add_node("register_appointment", node("register_appointment", register_appointment))
     g.add_node("extract_mutation", node("extract_mutation", extract_mutation))
@@ -680,7 +758,7 @@ def build_graph_orchestrator(
         "classify", route_by_intent,
         {"todo": "todo", "crud": "extract_mutation", "agent": "agent",
          "appointment": "register_appointment", "show_locked": "show_locked",
-         "rag": "rag"},
+         "at_time": "at_time", "rag": "rag"},
     )
     g.add_edge("register_appointment", "todo")  # register, then re-plan the day
     g.add_conditional_edges(
@@ -712,6 +790,7 @@ def build_graph_orchestrator(
     g.add_edge("apply_to_locked", "finalize")
     g.add_edge("summary", "finalize")
     g.add_edge("detail", "finalize")
+    g.add_edge("at_time", "finalize")
     g.add_edge("rag", "finalize")
     g.add_conditional_edges(
         "agent", should_continue, {"tools": "tools", "finalize": "finalize"}
@@ -802,45 +881,87 @@ class GraphOrchestrator:
             graph = self._graph_def.compile(checkpointer=saver)
             return await graph.ainvoke(payload, config=self._config(thread_id))
 
-    def start(
-        self, user_input: str, date: str | None = None, thread_id: str | None = None
-    ) -> PlannerResult:
-        """Begin a run. May return an ``interrupted`` result awaiting approval."""
-        thread_id = thread_id or str(uuid.uuid4())
-        state = _run_coro(
-            self._ainvoke(
-                {
-                    "user_input": user_input,
-                    "date": date,
-                    # `messages` is append-only — the conversation memory we keep.
-                    "messages": [HumanMessage(content=user_input)],
-                    # Everything else is per-turn scratch: reset it so a new turn
-                    # never re-emits the previous turn's plan/result/notice (the
-                    # checkpointer would otherwise carry them over on the thread).
-                    "intent": "",
-                    "tasks": None,
-                    "mutation": None,
-                    "approved": False,
-                    "notice": "",
-                    "result": "",
-                    "error": "",
-                    # Plan confirm-loop scratch (locked_plan persists, so it's NOT reset).
-                    "plan_feedback": "",
-                    "pending_plan": None,
-                },
-                thread_id,
-            )
-        )
-        return self._interpret(state, thread_id)
+    async def _astream(self, payload, thread_id: str, on_step) -> dict:
+        """Run the graph, reporting each node as it completes to *on_step(node, delta)*.
 
-    def resume(self, thread_id: str, decision: dict[str, Any]) -> PlannerResult:
+        Returns the final state in the same shape :meth:`_interpret` expects. Node
+        functions run in worker threads, so progress is surfaced *here* — on the
+        caller's thread, as each node finishes — which is what makes it safe to
+        drive a UI from. Falls back to reading the final snapshot for the result
+        and any pending interrupt.
+        """
+        interrupts = None
+        async with self._open_checkpointer() as saver:
+            graph = self._graph_def.compile(checkpointer=saver)
+            config = self._config(thread_id)
+            async for chunk in graph.astream(payload, config=config, stream_mode="updates"):
+                for node, delta in chunk.items():
+                    if node == "__interrupt__":
+                        interrupts = delta
+                    else:
+                        on_step(node, delta if isinstance(delta, dict) else {})
+            snapshot = await graph.aget_state(config)
+        state = dict(snapshot.values)
+        interrupts = interrupts or getattr(snapshot, "interrupts", None)
+        if interrupts:
+            state["__interrupt__"] = interrupts
+        return state
+
+    def _drive(self, payload, thread_id: str, on_step) -> dict:
+        """Run *payload* through the graph, streaming progress when *on_step* is set."""
+        runner = self._astream(payload, thread_id, on_step) if on_step else self._ainvoke(payload, thread_id)
+        return _run_coro(runner)
+
+    def start(
+        self,
+        user_input: str,
+        date: str | None = None,
+        thread_id: str | None = None,
+        on_step: "Callable[[str, dict], None] | None" = None,
+    ) -> PlannerResult:
+        """Begin a run. May return an ``interrupted`` result awaiting approval.
+
+        Pass *on_step(node, delta)* to receive each node as it completes (for a
+        live progress display); leave it ``None`` for the plain invoke path.
+        """
+        thread_id = thread_id or str(uuid.uuid4())
+        payload = {
+            "user_input": user_input,
+            "date": date,
+            # `messages` is append-only — the conversation memory we keep.
+            "messages": [HumanMessage(content=user_input)],
+            # Everything else is per-turn scratch: reset it so a new turn
+            # never re-emits the previous turn's plan/result/notice (the
+            # checkpointer would otherwise carry them over on the thread).
+            "intent": "",
+            "tasks": None,
+            "mutation": None,
+            "detected_appointment": None,
+            "approved": False,
+            "confirm_action": "",
+            "notice": "",
+            "result": "",
+            "error": "",
+            "progress": [],
+            # Plan confirm-loop scratch (locked_plan persists, so it's NOT reset).
+            "plan_feedback": "",
+            "pending_plan": None,
+        }
+        return self._interpret(self._drive(payload, thread_id, on_step), thread_id)
+
+    def resume(
+        self,
+        thread_id: str,
+        decision: dict[str, Any],
+        on_step: "Callable[[str, dict], None] | None" = None,
+    ) -> PlannerResult:
         """Resume an interrupted run with the user's approval *decision*.
 
         ``decision`` is e.g. ``{"action": "accept"}``, ``{"action": "reject",
-        "reason": "..."}``, or ``{"action": "edit", "args": {...}}``.
+        "reason": "..."}``, or ``{"action": "edit", "args": {...}}``. Pass
+        *on_step* to stream the post-approval steps (execute → re-plan, …).
         """
-        state = _run_coro(self._ainvoke(Command(resume=decision), thread_id))
-        return self._interpret(state, thread_id)
+        return self._interpret(self._drive(Command(resume=decision), thread_id, on_step), thread_id)
 
     def _interpret(self, state: dict, thread_id: str) -> PlannerResult:
         interrupts = state.get("__interrupt__")

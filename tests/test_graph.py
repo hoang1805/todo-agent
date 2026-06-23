@@ -234,12 +234,71 @@ def test_explicit_replan_regenerates_and_reconfirms():
 
 def test_recall_intent_routes_to_the_rag_agent():
     class _FakeRag:
-        def run(self, query):
+        def run(self, query, on_step=None):
+            if on_step:
+                on_step("searching memory")
             return f"recalled: {query}"
 
     go = build_graph_orchestrator(tools=[], model_name="dummy", use_llm=False, rag_agent=_FakeRag())
     out = go.run("what do I usually defer when busy?")
     assert out.startswith("recalled:")
+
+
+def test_recall_streams_rag_progress_steps():
+    class _FakeRag:
+        def run(self, query, on_step=None):
+            if on_step:
+                on_step("🔎 searching")
+                on_step("✅ enough")
+            return "recalled"
+
+    go = build_graph_orchestrator(tools=[], model_name="dummy", use_llm=False, rag_agent=_FakeRag())
+    seen = []
+    go.start("what do I usually defer when busy?", thread_id="rag-prog",
+             on_step=lambda node, delta: seen.extend((delta or {}).get("progress", [])))
+    assert seen == ["🔎 searching", "✅ enough"]  # the loop's phases surface live
+
+
+def test_rejecting_with_an_appointment_suggestion_blocks_that_time():
+    # Regression: a reject suggestion that is a fixed-time event must register as
+    # an appointment (block that slot) — not be parsed as the working-hours window
+    # (which collapsed the whole day onto the event).
+    go = build_graph_orchestrator(
+        tools=[], model_name="dummy", use_llm=False,
+        workday=Workday(start="09:00", end="20:00"),
+    )
+    go.start("plan my day", thread_id="appt", date="2026-06-23")
+    r = go.resume("appt", {"action": "reject",
+                           "reason": "i have lunch with my friend from 11am into 1.30pm."})
+    plan = (r.interrupt or {}).get("plan", "")
+    assert "11:00–13:30" in plan and "Lunch with my friend" in plan
+    assert "of 0 available" not in plan  # the day wasn't shrunk onto the event
+
+
+def test_at_time_intent_answers_from_the_locked_plan():
+    go = build_graph_orchestrator(
+        tools=[], model_name="dummy", use_llm=False,
+        workday=Workday(start="09:00", end="20:00"),
+    )
+    go.start("plan my day", thread_id="at", date="2026-06-23")
+    go.resume("at", {"action": "accept"})  # lock it
+    r = go.start("which task do I have at 18:30", thread_id="at", date="2026-06-23")
+    assert r.status == "done"
+    assert "18:30" in r.text and "Dinner" in r.text  # the meal block at that time
+
+
+def test_cancelling_a_plan_discards_it_without_locking_or_replanning():
+    go = build_graph_orchestrator(
+        tools=[], model_name="dummy", use_llm=False,
+        workday=Workday(start="09:00", end="20:00"),
+    )
+    go.start("plan my day", thread_id="cancel", date="2026-06-23")
+    r = go.resume("cancel", {"action": "cancel"})
+    assert r.status == "done"
+    assert "discarded" in r.text.lower()
+    # A follow-up plan still works (nothing was left locked).
+    r2 = go.start("plan my day", thread_id="cancel", date="2026-06-23")
+    assert r2.status == "interrupted"  # confirms again, not silently using a lock
 
 
 def test_locking_a_plan_writes_a_planning_log():

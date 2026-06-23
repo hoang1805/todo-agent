@@ -43,7 +43,7 @@ orchestrator classifies the request and routes it to specialist agents that comm
 user prompt
    │
    ▼
-Orchestrator ── classify intent (plan | summary | create/update/delete)
+Orchestrator ── classify intent (plan | summary | create/update/delete | recall)
    │
    ▼
 TodoAgent (data specialist)

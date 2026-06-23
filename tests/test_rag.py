@@ -89,3 +89,22 @@ def test_retriever_validates_results_and_drops_malformed():
 
     chunks = make_mcp_retriever([_Tool()])("documents", "q", 3)
     assert len(chunks) == 1 and chunks[0].text == "good"  # malformed dropped at the contract
+
+
+def test_retriever_unwraps_mcp_text_content_blocks():
+    """Across the MCP boundary each chunk arrives as a text-content block whose
+    ``text`` is the JSON of the real chunk — the retriever must unwrap it."""
+    import json
+
+    class _Tool:
+        name = "retrieve_document"
+
+        async def ainvoke(self, args):
+            chunk = {"text": "flights: book 21 days ahead", "score": 0.5,
+                     "source_type": "document", "metadata": {"file": "x.txt"}}
+            return [{"type": "text", "text": json.dumps(chunk), "id": "lc_1"}]
+
+    chunks = make_mcp_retriever([_Tool()])("documents", "q", 3)
+    assert len(chunks) == 1
+    assert chunks[0].text == "flights: book 21 days ahead"
+    assert chunks[0].source_type == "document" and chunks[0].score == 0.5

@@ -40,14 +40,24 @@ class RAGAgent:
         self._generate = generate
         self.k = k
 
-    def run(self, query: str) -> str:
+    def run(self, query: str, on_step: "Callable[[str], None] | None" = None) -> str:
+        """Run the loop. *on_step* (optional) receives a human-readable line for
+        each phase — retrieve, judge, reformulate — so a UI can show the agent's
+        progress step by step instead of a single opaque wait."""
+        def step(msg: str) -> None:
+            if on_step is not None:
+                on_step(msg)
+
         collected: list[DataChunk] = []   # accumulate — never discarded between passes
         current_query, source = query, "both"
+        where = {"both": "logs & documents", "logs": "planning logs", "documents": "documents"}
 
         for i in range(self.MAX_ITERATIONS):
+            step(f"🔎 Searching {where.get(source, source)} (pass {i + 1}/{self.MAX_ITERATIONS}) — “{current_query}”")
             chunks = self._retrieve(source, current_query, self.k)
             seen = {c.text for c in collected}
             collected.extend(c for c in chunks if c.text not in seen)
+            step(f"📚 Got {len(chunks)} result(s); {len(collected)} gathered so far")
 
             decision = self._judge(query, collected)
             logger.info(
@@ -55,15 +65,20 @@ class RAGAgent:
                 i, current_query, source, len(chunks), decision.sufficient, decision.next_query,
             )
             if decision.sufficient:
+                step("✅ Enough to answer — composing a grounded response")
                 return self._generate(query, collected)
 
             current_query = decision.next_query or current_query
             source = decision.next_source or source
+            if i < self.MAX_ITERATIONS - 1:
+                step(f"↻ Not enough — reformulating to “{current_query}”")
 
         # Out of iterations — answer honestly from whatever was collected.
         logger.info("[rag] stopped after %d iterations (%d chunks)", self.MAX_ITERATIONS, len(collected))
         if collected:
+            step("⏱️ Out of retries — answering from what I found (with a caveat)")
             return self._generate(query, collected)
+        step("🚫 Nothing relevant found in your logs or documents")
         return "I couldn't find anything relevant in your logs or documents."
 
 
@@ -72,8 +87,33 @@ class RAGAgent:
 # ---------------------------------------------------------------------------
 
 
+def _unwrap_chunk(item: object) -> list[dict]:
+    """Turn one result item into zero or more chunk dicts.
+
+    Across the MCP boundary each chunk arrives as a text-content block —
+    ``{"type": "text", "text": "<json of the chunk>", "id": ...}`` — so the real
+    ``DataChunk``-shaped dict is JSON-encoded inside ``text``. Unwrap that; pass
+    through items that are already chunk-shaped.
+    """
+    if not isinstance(item, dict):
+        return []
+    if "source_type" in item and "score" in item:  # already a chunk
+        return [item]
+    text = item.get("text")  # MCP text-content block: the chunk JSON lives here
+    if isinstance(text, str):
+        try:
+            inner = json.loads(text)
+        except (ValueError, TypeError):
+            return []
+        if isinstance(inner, dict):
+            return [inner]
+        if isinstance(inner, list):
+            return [r for r in inner if isinstance(r, dict)]
+    return []
+
+
 def _coerce_chunks(result: object) -> list[dict]:
-    """Turn a memory-tool result (list / JSON string / error dict) into dicts."""
+    """Turn a memory-tool result (list / JSON string / error / MCP blocks) into chunk dicts."""
     if isinstance(result, str):
         try:
             result = json.loads(result)
@@ -83,7 +123,12 @@ def _coerce_chunks(result: object) -> list[dict]:
         if result.get("ok") is False:  # structured recoverable error
             return []
         result = result.get("results") or result.get("data") or []
-    return [r for r in result if isinstance(r, dict)] if isinstance(result, list) else []
+    if not isinstance(result, list):
+        return []
+    chunks: list[dict] = []
+    for item in result:
+        chunks.extend(_unwrap_chunk(item))
+    return chunks
 
 
 def make_mcp_retriever(tools: list) -> Retriever:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import streamlit as st
@@ -71,9 +72,11 @@ def render_main_view(
     if "thread_id" not in st.session_state:
         st.session_state.thread_id = str(uuid.uuid4())
 
-    # Render chat history
+    # Render chat history (including the persisted step trace for planner turns).
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
+            if message.get("steps"):
+                _render_steps(st, message["steps"])
             st.markdown(message["content"])
 
     # Pending human-in-the-loop approval (Planner mode) — render until resolved.
@@ -96,7 +99,10 @@ def render_main_view(
         if mode == PLANNER_MODE:
             # The planner may pause for approval, so route through session state
             # and rerun (the approval panel / result renders on the next pass).
-            with st.spinner("Planning…", show_time=True):
+            # Echo the prompt now and show the live step box in the reply bubble;
+            # both are re-rendered from history after the rerun.
+            st.chat_message("user").markdown(prompt)
+            with st.chat_message("assistant"):
                 _start_planner_turn(_get_planner(tools, model, temperature), prompt)
             st.rerun()
 
@@ -122,6 +128,77 @@ def render_main_view(
 # ---------------------------------------------------------------------------
 # Planner (multi-agent) helpers — with human-in-the-loop approval
 # ---------------------------------------------------------------------------
+
+
+# Friendly, user-facing label for each graph node, shown live as the planner works
+# so the multi-agent steps are visible instead of hidden behind one spinner.
+_PLANNER_STEP_LABELS = {
+    "classify": "🧭 Understanding your request",
+    "todo": "📥 Fetching & validating your tasks",
+    "planner": "🗓️ Planning your day",
+    "summary": "📋 Summarizing your tasks",
+    "detail": "🔍 Looking up that task",
+    "at_time": "🕖 Checking your plan at that time",
+    "rag": "🧠 Searching your memory",
+    "register_appointment": "📌 Registering the appointment",
+    "extract_mutation": "✍️ Parsing your change",
+    "confirm_plan": "⏳ Preparing the plan for your confirmation",
+    "confirm_mutation": "⏳ Preparing the change for your approval",
+    "execute_mutation": "💾 Applying the change",
+    "apply_to_locked": "📝 Updating your locked plan",
+    "show_locked": "📋 Showing your locked plan",
+    "agent": "🤖 Deciding the next step",
+    "tools": "🔧 Running a tool",
+    "finalize": "✨ Wrapping up",
+}
+
+
+def _format_step(node: str, delta: dict) -> list[str]:
+    """Format one completed node as trace lines — the node and its routing-relevant
+    state delta (e.g. ``intent='recall'``), mirroring the terminal ``PLANNER_TRACE``
+    output — plus any RAG loop sub-steps carried in ``delta['progress']``.
+    """
+    from agents.graph_orchestrator import _summarize_delta
+
+    label = _PLANNER_STEP_LABELS.get(node, node)
+    summary = _summarize_delta({k: v for k, v in (delta or {}).items() if k != "progress"})
+    lines = [f"**▶ {label}** &nbsp;`{node}` → {summary}"]
+    for sub in (delta or {}).get("progress", []):
+        lines.append(f"&nbsp;&nbsp;&nbsp;&nbsp;↳ {sub}")
+    return lines
+
+
+def _render_steps(container, steps: list[str], *, expanded: bool = True) -> None:
+    """Render an accumulated trace inside a (kept-open) expander on *container*."""
+    with container.expander("🧭 Steps the agents took", expanded=expanded):
+        for line in steps:
+            st.markdown(line, unsafe_allow_html=True)
+
+
+@contextmanager
+def _planner_progress(label: str = "Working on your request…"):
+    """Yield ``(on_step, steps)``.
+
+    *on_step(node, delta)* writes each node's trace line into a live status box **and**
+    accumulates it into *steps*, so the very same trace can be stored on the chat
+    message and re-shown after the rerun — it no longer disappears. The box shows
+    which node ran and where it routed (the delta), and stays expanded when done.
+    """
+    status = st.status(label, expanded=True)
+    steps: list[str] = []
+
+    def on_step(node: str, delta: dict) -> None:
+        for line in _format_step(node, delta):
+            steps.append(line)
+            status.markdown(line, unsafe_allow_html=True)
+
+    try:
+        yield on_step, steps
+    except Exception:
+        status.update(label="⚠️ Something went wrong", state="error", expanded=True)
+        raise
+    else:
+        status.update(label="✅ Done — steps below", state="complete", expanded=True)
 
 
 def _get_planner(tools: list[BaseTool], model: str, temperature: float):
@@ -153,14 +230,18 @@ def _as_markdown(text: str) -> str:
     return (text or "").replace("\n", "  \n")
 
 
-def _consume_planner_result(result) -> None:
-    """Turn a PlannerResult into chat output and/or a pending approval."""
+def _consume_planner_result(result, steps: list[str] | None = None) -> None:
+    """Turn a PlannerResult into chat output and/or a pending approval.
+
+    *steps* (the trace collected during this run) is stored on the message so it
+    re-renders in chat history after the rerun instead of vanishing.
+    """
     # A resolved/new turn invalidates any field errors from a previous review.
     st.session_state.pop("planner_edit_errors", None)
     if result.status == "done":
         st.session_state.planner_pending = None
         st.session_state.messages.append(
-            {"role": "ai", "content": _as_markdown(result.text)}
+            {"role": "ai", "content": _as_markdown(result.text), "steps": steps}
         )
         return
 
@@ -177,6 +258,7 @@ def _consume_planner_result(result) -> None:
                 "check the details in the table below, edit anything that's off, "
                 "then submit."
             ),
+            "steps": steps,
         }
     )
 
@@ -190,12 +272,14 @@ def _start_planner_turn(planner, prompt: str) -> None:
     """
     from core.tools.common_tools import get_today_date
 
-    result = planner.start(
-        prompt,
-        date=get_today_date.invoke({}),
-        thread_id=st.session_state.thread_id,
-    )
-    _consume_planner_result(result)
+    with _planner_progress() as (on_step, steps):
+        result = planner.start(
+            prompt,
+            date=get_today_date.invoke({}),
+            thread_id=st.session_state.thread_id,
+            on_step=on_step,
+        )
+    _consume_planner_result(result, steps)
 
 
 # Fields that describe the *operation* itself (which tool / what kind of write)
@@ -317,18 +401,24 @@ def _render_plan_approval(planner, pending: dict) -> None:
     )
     accept, reject = st.columns(2)
     if accept.button("✅ Accept & lock", use_container_width=True, key="plan_accept"):
-        with st.spinner("Locking the plan…"):
-            result = planner.resume(pending["thread_id"], {"action": "accept"})
+        with _planner_progress("Locking the plan…") as (on_step, steps):
+            result = planner.resume(pending["thread_id"], {"action": "accept"}, on_step=on_step)
         st.session_state.pop("plan_suggestion", None)
-        _consume_planner_result(result)
+        _consume_planner_result(result, steps)
         st.rerun()
     if reject.button("✏️ Re-plan with my suggestion", use_container_width=True, key="plan_reject"):
-        with st.spinner("Re-planning…"):
+        with _planner_progress("Re-planning…") as (on_step, steps):
             result = planner.resume(
-                pending["thread_id"], {"action": "reject", "reason": suggestion}
+                pending["thread_id"], {"action": "reject", "reason": suggestion}, on_step=on_step
             )
         st.session_state.pop("plan_suggestion", None)
-        _consume_planner_result(result)
+        _consume_planner_result(result, steps)
+        st.rerun()
+    if st.button("🚫 Cancel", use_container_width=True, key="plan_cancel"):
+        with _planner_progress("Cancelling…") as (on_step, steps):
+            result = planner.resume(pending["thread_id"], {"action": "cancel"}, on_step=on_step)
+        st.session_state.pop("plan_suggestion", None)
+        _consume_planner_result(result, steps)
         st.rerun()
 
 
@@ -419,18 +509,18 @@ def _render_approval_panel(planner, tools: list[BaseTool]) -> None:
             st.session_state.planner_edit_errors = validation_errors
             st.rerun()
         st.session_state.pop("planner_edit_errors", None)
-        with st.spinner("Applying…"):
+        with _planner_progress("Applying…") as (on_step, steps):
             result = planner.resume(
-                pending["thread_id"], {"action": "edit", "args": new_args}
+                pending["thread_id"], {"action": "edit", "args": new_args}, on_step=on_step
             )
-        _consume_planner_result(result)
+        _consume_planner_result(result, steps)
         st.rerun()
     if reject.button("❌ Reject", use_container_width=True, key="planner_reject"):
-        with st.spinner("Cancelling…"):
+        with _planner_progress("Cancelling…") as (on_step, steps):
             result = planner.resume(
-                pending["thread_id"], {"action": "reject", "reason": "user declined"}
+                pending["thread_id"], {"action": "reject", "reason": "user declined"}, on_step=on_step
             )
-        _consume_planner_result(result)
+        _consume_planner_result(result, steps)
         st.rerun()
 
 

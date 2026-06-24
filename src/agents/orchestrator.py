@@ -20,9 +20,9 @@ import asyncio
 import json
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Literal
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from agents.planner_agent import (
     DEFAULT_WORKDAY,
@@ -70,6 +70,7 @@ class Intent(str, Enum):
     delete = "delete"
     weather = "weather"
     recall = "recall"
+    complex = "complex"  # bundles several requests → decomposed into steps
     unknown = "unknown"
 
 
@@ -498,6 +499,87 @@ def make_appointment_parser(
             return parse_appointment(text)
 
     return parse
+
+
+# ---------------------------------------------------------------------------
+# Complex-prompt decomposition: split a multi-intent request into ordered,
+# single-intent steps so each runs through its *real* path (the plan step keeps
+# its confirm loop, CRUD steps keep their approval) instead of an opaque agent
+# loop that reimplements them.
+# ---------------------------------------------------------------------------
+
+class Step(BaseModel):
+    """One single-intent step of a decomposed complex request."""
+
+    intent: Literal[
+        "plan", "summary", "detail", "at_time", "appointment",
+        "add", "update", "delete", "recall", "weather", "ask",
+    ]
+    text: str  # the minimal sub-prompt needed to perform this step
+
+
+class StepPlan(BaseModel):
+    steps: list[Step]
+
+
+# Run order within a complex request:
+#   edits (0) → neutral steps (1) → the (re)plan (2) → a reasoning/answer step (3).
+# So the plan reflects prior edits, and an `ask` step that reasons over the whole
+# request sees every earlier result. Python's sort is stable → order preserved
+# within a group.
+_STEP_PRIORITY = {
+    "add": 0, "update": 0, "delete": 0,
+    "appointment": 2, "plan": 2,
+    "ask": 3,
+}
+
+
+def order_steps(steps: list[dict]) -> list[dict]:
+    """Reorder decomposed steps so task edits run before any (re)plan."""
+    return sorted(steps, key=lambda s: _STEP_PRIORITY.get(s.get("intent"), 1))
+
+
+def llm_decompose(text: str, model_name: str, temperature: float = 0.0) -> list[dict]:
+    """Split a complex request into ordered single-intent steps via structured output.
+
+    Raises on an LLM/parse failure so the caller can fall back to the agent loop.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from agents.todo_agent import _loads_jsonish
+    from core.services.llm_client import create_ollama_model
+    from core.services.prompts import load_prompt
+
+    schema = StepPlan.model_json_schema()
+    llm = create_ollama_model(model_name, temperature, format=schema, with_thinking=False)
+    response = llm.invoke([
+        SystemMessage(content=load_prompt("complex_decomposer_system")),
+        HumanMessage(content=text),
+    ])
+    data = _loads_jsonish(response.content)
+    if isinstance(data, list):  # model returned a bare array of steps
+        data = {"steps": data}
+    plan = StepPlan.model_validate(data)
+    return [s.model_dump() for s in plan.steps]
+
+
+def make_decomposer(model_name: str, temperature: float, use_llm: bool) -> "Callable[[str], list[dict]]":
+    """Build a complex-request decomposer.
+
+    With ``use_llm`` off (or when the model errors) it returns ``[]`` — the graph
+    then falls back to the agent⇄tools loop, so behavior degrades gracefully.
+    """
+    if not use_llm:
+        return lambda text: []
+
+    def decompose(text: str) -> list[dict]:
+        try:
+            return llm_decompose(text, model_name, temperature)
+        except Exception as exc:  # noqa: BLE001 — recoverable: fall back to the agent loop
+            logger.warning("LLM decomposition failed (%s); using the agent loop.", exc)
+            return []
+
+    return decompose
 
 
 def make_mutation_executor(tools: list[BaseTool]) -> MutationExecutor:

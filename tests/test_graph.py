@@ -60,13 +60,14 @@ class _ScriptedLLM:
         return msg
 
 
-def test_multi_intent_prompt_routes_to_agent_loop(monkeypatch):
-    # "plan ... and add ..." hits two intent families -> routed to the agent loop.
-    # The fake answers immediately (no tool calls), proving the agent path ran.
+def test_multi_intent_prompt_falls_back_to_agent_loop_without_decomposition(monkeypatch):
+    # A multi-intent prompt is normally decomposed; with the decomposer returning
+    # nothing it falls back to the agent loop. The fake answers immediately.
     fake = _ScriptedLLM([AIMessage(content="handled both steps")])
     monkeypatch.setattr(llm_client, "create_ollama_model", lambda *a, **k: fake)
 
-    go = build_graph_orchestrator(tools=[], model_name="dummy", use_llm=True)
+    go = build_graph_orchestrator(tools=[], model_name="dummy", use_llm=True,
+                                  classifier=lambda text: "complex", decomposer=lambda text: [])
     out = go.run("plan my day and add a task to call the bank")
 
     assert out == "handled both steps"
@@ -91,7 +92,7 @@ def test_agent_tools_loop_executes_a_tool_then_finishes(monkeypatch):
     monkeypatch.setattr(llm_client, "create_ollama_model", lambda *a, **k: fake)
 
     go = build_graph_orchestrator(
-        tools=[echo], model_name="dummy", use_llm=True
+        tools=[echo], model_name="dummy", use_llm=True, classifier=lambda text: "unknown"
     )
     # "echo ..." is not plan/summary, so it routes to the agent loop.
     out = go.run("please echo pong")
@@ -122,10 +123,11 @@ def test_mutating_tool_requires_approval_then_runs_on_accept(monkeypatch):
     fake = _ScriptedLLM(scripted)
     monkeypatch.setattr(llm_client, "create_ollama_model", lambda *a, **k: fake)
 
-    go = build_graph_orchestrator(tools=[create_task], model_name="dummy", use_llm=True)
+    go = build_graph_orchestrator(tools=[create_task], model_name="dummy", use_llm=True,
+                                  classifier=lambda text: "complex", decomposer=lambda text: [])
 
-    # Multi-intent prompt -> routed to the agent⇄tools loop (the CRUD intents on
-    # their own now take the deterministic CRUD path, tested separately).
+    # Multi-intent prompt; with decomposition unavailable it falls back to the
+    # agent⇄tools loop, whose mutating tool is gated for approval.
     pending = go.start("plan my day and add a task to email the client")
     assert pending.status == "interrupted"
     assert pending.interrupt["tool"] == "create_task"
@@ -157,9 +159,10 @@ def test_mutating_tool_is_not_run_on_reject(monkeypatch):
     fake = _ScriptedLLM(scripted)
     monkeypatch.setattr(llm_client, "create_ollama_model", lambda *a, **k: fake)
 
-    go = build_graph_orchestrator(tools=[delete_task], model_name="dummy", use_llm=True)
+    go = build_graph_orchestrator(tools=[delete_task], model_name="dummy", use_llm=True,
+                                  classifier=lambda text: "complex", decomposer=lambda text: [])
 
-    # Multi-intent prompt -> routed to the agent⇄tools loop (see note above).
+    # Multi-intent prompt; decomposition unavailable → agent⇄tools loop fallback.
     pending = go.start("plan my day and delete task 5")
     assert pending.status == "interrupted"
 
@@ -273,6 +276,81 @@ def test_rejecting_with_an_appointment_suggestion_blocks_that_time():
     plan = (r.interrupt or {}).get("plan", "")
     assert "11:00–13:30" in plan and "Lunch with my friend" in plan
     assert "of 0 available" not in plan  # the day wasn't shrunk onto the event
+
+
+def test_complex_prompt_decomposes_runs_each_step_and_confirms_plan_last():
+    # The decomposer returns the plan before the summary; the graph reorders it so
+    # the (confirmed) plan runs LAST, and each step runs its real path.
+    go = build_graph_orchestrator(
+        tools=[], model_name="dummy", use_llm=False,
+        workday=Workday(start="09:00", end="18:00"),
+        decomposer=lambda text: [
+            {"intent": "plan", "text": "plan my day"},
+            {"intent": "summary", "text": "what's on my list"},
+        ],
+    )
+    # multi-intent prompt → classify 'complex' → decompose
+    r = go.start("summarize my tasks and plan my day", thread_id="cx", date="2026-06-24")
+    # the plan step (ordered last) pauses for confirmation — proving it didn't skip
+    # the confirm loop the way the old agent-loop path did.
+    assert r.status == "interrupted"
+    assert (r.interrupt or {}).get("type") == "plan_approval"
+
+    done = go.resume("cx", {"action": "accept"})
+    assert done.status == "done"
+    assert "task(s)" in done.text        # the summary step ran
+    assert "Your plan" in done.text      # the plan step ran
+    assert "Plan locked" in done.text    # …and went through confirm + lock
+
+
+def test_order_steps_puts_edits_first_plan_then_ask_last():
+    from agents.orchestrator import order_steps
+
+    ordered = order_steps([
+        {"intent": "ask", "text": "k"},
+        {"intent": "plan", "text": "p"},
+        {"intent": "weather", "text": "w"},
+        {"intent": "delete", "text": "d"},
+        {"intent": "add", "text": "a"},
+    ])
+    # edits → neutral → plan → ask (the reasoning step sees everything before it)
+    assert [s["intent"] for s in ordered] == ["delete", "add", "weather", "plan", "ask"]
+
+
+def test_ask_step_receives_earlier_step_results_as_context(monkeypatch):
+    # A recording fake LLM captures what the `ask` step's agent call actually sees.
+    class _Recorder:
+        def __init__(self):
+            self.seen = ""
+        def bind_tools(self, _tools):
+            return self
+        def invoke(self, messages):
+            self.seen = "\n".join(str(getattr(m, "content", "")) for m in messages)
+            return AIMessage(content="Do the report first.")
+
+    rec = _Recorder()
+    monkeypatch.setattr(llm_client, "create_ollama_model", lambda *a, **k: rec)
+
+    class _FakeRag:
+        def run(self, query, on_step=None):
+            return "You usually defer reading tasks when busy."
+
+    go = build_graph_orchestrator(
+        tools=[], model_name="dummy", use_llm=True, rag_agent=_FakeRag(),
+        classifier=lambda text: "complex",
+        # recall (neutral) then ask (last); the ask must see the recall's output.
+        decomposer=lambda text: [
+            {"intent": "recall", "text": "what do I defer when busy?"},
+            {"intent": "ask", "text": "so which should I do first?"},
+        ],
+    )
+    # "recall … and plan …" → 2 intent families → complex → decompose.
+    done = go.start("recall what I defer and plan my day", thread_id="ctx", date="2026-06-24")
+
+    assert done.status == "done"
+    assert "defer reading tasks" in rec.seen           # earlier result fed into the ask step
+    assert "Do the report first." in done.text          # the ask step's answer is in the output
+    assert "defer reading tasks" in done.text            # and the recall result too (joined)
 
 
 def test_at_time_intent_answers_from_the_locked_plan():

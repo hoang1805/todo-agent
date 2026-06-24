@@ -69,7 +69,6 @@ from langgraph.types import Command, interrupt
 
 from agents.human_in_the_loop import wrap_mutating_tools
 from agents.orchestrator import (
-    Intent,
     MutationExecutor,
     _run_coro,
     classify_intent,
@@ -79,12 +78,14 @@ from agents.orchestrator import (
     llm_classify_intent,
     wants_detail,
     make_appointment_parser,
+    make_decomposer,
     make_mcp_fetcher,
     make_mutation_executor,
     make_mutation_parser,
     make_normalizer,
     make_planner,
     matched_intent_families,
+    order_steps,
 )
 from agents.planner_agent import (
     DEFAULT_WORKDAY,
@@ -130,6 +131,16 @@ _MUTATION_PARSE_ERROR_MSG = (
     "\"mark 'Finish Q3 report' as done\"."
 )
 _REJECTED_MSG = "Okay — I left your tasks unchanged."
+
+
+def _in_sequence(state) -> bool:
+    """True while a decomposed complex prompt is being run step by step."""
+    return bool(state.get("steps"))
+
+
+def _more_steps(state) -> bool:
+    """True if the step queue has steps left to dispatch."""
+    return state.get("step_index", 0) < len(state.get("steps") or [])
 
 
 def _summarize_delta(delta: dict) -> str:
@@ -230,6 +241,12 @@ class PlannerState(TypedDict):
     # Per-turn, human-readable progress lines (e.g. the RAG loop's retrieve/judge/
     # reformulate phases). Surfaced live in the UI via streaming; reset each turn.
     progress: NotRequired[list[str]]
+    # Complex-prompt decomposition: an ordered queue of single-intent steps
+    # ({"intent", "text"}), a cursor into it, and each step's result. The loop runs
+    # one step per pass through its real handler, then joins the results. Reset each turn.
+    steps: NotRequired[list[dict]]
+    step_index: NotRequired[int]
+    step_results: NotRequired[list[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +274,8 @@ def build_graph_orchestrator(
     mutation_executor: MutationExecutor | None = None,
     planner: Planner | None = None,
     appointment_parser: "Callable[[str], object] | None" = None,
+    decomposer: "Callable[[str], list[dict]] | None" = None,
+    classifier: "Callable[[str], str] | None" = None,
     memory_tools: list[BaseTool] | None = None,
     rag_agent: RAGAgent | None = None,
     memory_writer: "Callable[[str, str], None] | None" = None,
@@ -278,6 +297,7 @@ def build_graph_orchestrator(
     mutation_executor = mutation_executor or make_mutation_executor(tools)
     planner = planner or make_planner(model_name, temperature, use_llm)
     appointment_parser = appointment_parser or make_appointment_parser(model_name, temperature, use_llm)
+    decomposer = decomposer or make_decomposer(model_name, temperature, use_llm)
     # Memory tools (retrieve_*/remember) arrive in the same combined `tools` list,
     # so default to it; the retriever/writer pick the right tools by name.
     memory_tools = tools if memory_tools is None else memory_tools
@@ -357,39 +377,28 @@ def build_graph_orchestrator(
     def classify(state: PlannerState) -> dict:
         # Echo the user's prompt before any reasoning (for logs/observability).
         logger.info("USER PROMPT: %s", state["user_input"])
-        # "show me the detail of task X" usually also trips a summary keyword
-        # ("show me"); detail is the more specific intent, so resolve it first
-        # before the multi-family check would mis-route it to the agent loop.
-        if wants_detail(state["user_input"]):
+        text = state["user_input"]
+        # Classification is the LLM's job: a single call decides among every intent
+        # (incl. `complex` for multi-step requests, `at_time`, `appointment`).
+        # `llm_classify_intent` already falls back to the keyword classifier if the
+        # model is unreachable or returns an invalid label, so this stays robust.
+        if classifier is not None:
+            return {"intent": classifier(text)}
+        if use_llm:
+            return {"intent": llm_classify_intent(text, model_name).value}
+        # Offline (no model): the deterministic keyword path, with the cheap
+        # detail/time/appointment pre-checks the keyword classifier can't make.
+        if wants_detail(text):
             return {"intent": "detail"}
-        # "which task do I have at 7pm?" — a lookup against the plan at a time.
-        # Cheap (regex) and checked before the appointment LLM call so a *question*
-        # about a time isn't mistaken for *stating* a commitment.
-        if asks_about_time(state["user_input"]):
+        if asks_about_time(text):
             return {"intent": "at_time"}
-        # A fixed-time commitment ("dinner with family from 17:30 to 19:30") is
-        # registered as an appointment and the day re-planned around it — never
-        # turned into a flexible task. Parsed once here (LLM with a regex fallback)
-        # and carried in state so `register_appointment` doesn't parse it again.
-        appt = appointment_parser(state["user_input"])
+        appt = appointment_parser(text)  # regex offline
         if appt is not None:
-            return {
-                "intent": "appointment",
-                "detected_appointment": {"name": appt.name, "start": appt.start, "end": appt.end},
-            }
-        # A prompt that touches more than one intent family (e.g. "plan my day
-        # AND add a task") is multi-step — send it to the agent loop, which can
-        # sequence several tools, instead of a single deterministic path.
-        if len(set(matched_intent_families(state["user_input"]))) > 1:
+            return {"intent": "appointment",
+                    "detected_appointment": {"name": appt.name, "start": appt.start, "end": appt.end}}
+        if len(set(matched_intent_families(text))) > 1:
             return {"intent": "complex"}
-        # Keyword rules are instant and deterministic for clear prompts. Only when
-        # they can't tell (unknown) do we spend an LLM call to classify natural
-        # phrasing — and `llm_classify_intent` itself falls back to keywords on any
-        # error, so this never makes classification less reliable.
-        intent = classify_intent(state["user_input"])
-        if intent is Intent.unknown and use_llm:
-            intent = llm_classify_intent(state["user_input"], model_name)
-        return {"intent": intent.value}
+        return {"intent": classify_intent(text).value}
 
     def run_todo(state: PlannerState) -> dict:
         try:
@@ -557,6 +566,56 @@ def build_graph_orchestrator(
             plan = planner(tasks, wd, state.get("date"))
         return {"result": describe_plan_at_time(plan, when)}
 
+    # -- complex path: decompose into single-intent steps, run each for real ----
+
+    # Step intents whose handler reads `user_input`/state (set by `dispatch`).
+    # Anything else (weather/unknown) routes to the agent loop, which reads
+    # `messages`, so dispatch hands it the step text as the latest instruction.
+    _DETERMINISTIC_STEP_INTENTS = {
+        "plan", "summary", "detail", "at_time", "appointment", "add", "update", "delete", "recall",
+    }
+
+    def decompose(state: PlannerState) -> dict:
+        """Split a multi-intent prompt into ordered single-intent steps.
+
+        Empty (model off/failed) → fall back to the agent⇄tools loop.
+        """
+        steps = order_steps(decomposer(state["user_input"]))
+        if not steps:
+            return {"steps": []}
+        return {"steps": steps, "step_index": 0, "step_results": []}
+
+    def dispatch(state: PlannerState) -> dict:
+        """Pop the next step: set its intent + sub-prompt and reset per-step scratch
+        so its handler runs exactly as a standalone single-intent turn would."""
+        steps = state["steps"]
+        i = state.get("step_index", 0)
+        step = steps[i]
+        out: dict = {
+            "intent": step["intent"],
+            "user_input": step["text"],
+            "step_index": i + 1,
+            # Per-step scratch reset (cross-turn fields — locked_plan, appointments,
+            # work_hours, focus_task — intentionally persist across steps).
+            "tasks": None, "mutation": None, "approved": False, "confirm_action": "",
+            "notice": "", "result": "", "error": "", "detected_appointment": None,
+            "plan_feedback": "", "pending_plan": None,
+        }
+        if step["intent"] not in _DETERMINISTIC_STEP_INTENTS:
+            # Agent-loop step (`ask`/`weather`): hand it the step text as the latest
+            # instruction, prefixed with earlier steps' results so a reasoning step
+            # ("…then tell me which to do first") can build on them.
+            prior = state.get("step_results") or []
+            instruction = step["text"]
+            if prior:
+                context = "\n\n".join(prior)
+                instruction = (
+                    f"Results from earlier steps of this request:\n\n{context}\n\n"
+                    f"Using those where relevant, now: {step['text']}"
+                )
+            out["messages"] = [HumanMessage(content=instruction)]
+        return out
+
     def run_rag(state: PlannerState) -> dict:
         """The 'recall' branch — the RAGAgent retrieves + reasons over memory.
 
@@ -647,11 +706,26 @@ def build_graph_orchestrator(
             final = f"{notice}\n\n{state['result']}" if notice else state["result"]
         elif state.get("error"):
             final = f"{notice}\n\n{state['error']}" if notice else state["error"]
+        elif notice:
+            # A standalone confirmation (e.g. a CRUD step in a sequence that skips
+            # the auto-replan) — surface it on its own.
+            final = notice
         elif state.get("intent") in (None, "unknown") and not msgs:
             final = _UNKNOWN_MSG
         else:
             last = msgs[-1] if msgs else None
             final = getattr(last, "content", "") or _UNKNOWN_MSG
+
+        # Sequence mode: accumulate each step's result and emit one joined message
+        # only on the last step (loop back to `dispatch` until the queue is empty).
+        if state.get("steps"):
+            results = list(state.get("step_results") or [])
+            if final:
+                results.append(final)
+            if _more_steps(state):
+                return {"step_results": results, "result": ""}
+            joined = "\n\n".join(r for r in results if r) or _UNKNOWN_MSG
+            return {"result": joined, "step_results": results, "messages": [AIMessage(content=joined)]}
 
         out: dict = {"result": final}
         # Record the assistant's reply in the conversation log so the next turn
@@ -671,13 +745,18 @@ def build_graph_orchestrator(
 
     def route_by_intent(state: PlannerState) -> str:
         # plan/summary → deterministic read pipeline; add/update/delete → CRUD
-        # path; everything else (incl. multi-intent "complex") → the agent loop.
+        # path; a multi-intent "complex" prompt → decompose into single-intent
+        # steps; anything else → the agent loop. Shared by `classify` and `dispatch`.
         intent = state["intent"]
+        if intent == "complex":
+            return "decompose"
         if intent == "appointment":
             return "appointment"
         if intent == "plan":
-            # A locked plan is shown as-is unless the user asks to "replan".
-            if state.get("locked_plan") and not wants_replan(state["user_input"]):
+            # A locked plan is shown as-is unless the user asks to "replan" — but a
+            # plan step *inside a sequence* always regenerates, so it reflects the
+            # edits the earlier steps just made.
+            if state.get("locked_plan") and not wants_replan(state["user_input"]) and not _in_sequence(state):
                 return "show_locked"
             return "todo"
         if intent in ("summary", "detail"):
@@ -722,8 +801,20 @@ def build_graph_orchestrator(
     def route_after_execute(state: PlannerState) -> str:
         if state.get("error"):
             return "finalize"
+        # In a sequence, a later plan step (ordered last) does the planning, so
+        # skip the per-mutation auto-replan and just surface the confirmation.
+        if _in_sequence(state):
+            return "finalize"
         # Locked plan → patch it in place; otherwise re-plan (unlocked).
         return "apply_to_locked" if state.get("locked_plan") else "todo"
+
+    def route_after_decompose(state: PlannerState) -> str:
+        # Steps found → run them; none (model off/failed) → the agent⇄tools loop.
+        return "dispatch" if state.get("steps") else "agent"
+
+    def route_after_finalize(state: PlannerState) -> str:
+        # In a sequence with steps left, loop back for the next one; else end.
+        return "dispatch" if _more_steps(state) else END
 
     def should_continue(state: PlannerState) -> str:
         last = state["messages"][-1]
@@ -734,8 +825,17 @@ def build_graph_orchestrator(
     observe = observe or bool(os.getenv("PLANNER_TRACE"))
     node = (lambda name, fn: _trace_node(name, fn)) if observe else (lambda name, fn: fn)
 
+    # Shared intent → node map (used by both `classify` and the per-step `dispatch`).
+    intent_routes = {
+        "todo": "todo", "crud": "extract_mutation", "agent": "agent",
+        "appointment": "register_appointment", "show_locked": "show_locked",
+        "at_time": "at_time", "rag": "rag", "decompose": "decompose",
+    }
+
     g = StateGraph(PlannerState)
     g.add_node("classify", node("classify", classify))
+    g.add_node("decompose", node("decompose", decompose))
+    g.add_node("dispatch", node("dispatch", dispatch))
     g.add_node("todo", node("todo", run_todo))
     g.add_node("planner", node("planner", run_planner))
     g.add_node("confirm_plan", node("confirm_plan", confirm_plan))
@@ -754,12 +854,12 @@ def build_graph_orchestrator(
     g.add_node("finalize", node("finalize", finalize))
 
     g.add_edge(START, "classify")
+    g.add_conditional_edges("classify", route_by_intent, intent_routes)
+    # complex → decompose → (dispatch the step queue | agent loop fallback)
     g.add_conditional_edges(
-        "classify", route_by_intent,
-        {"todo": "todo", "crud": "extract_mutation", "agent": "agent",
-         "appointment": "register_appointment", "show_locked": "show_locked",
-         "at_time": "at_time", "rag": "rag"},
+        "decompose", route_after_decompose, {"dispatch": "dispatch", "agent": "agent"}
     )
+    g.add_conditional_edges("dispatch", route_by_intent, intent_routes)
     g.add_edge("register_appointment", "todo")  # register, then re-plan the day
     g.add_conditional_edges(
         "todo", route_after_todo,
@@ -796,7 +896,8 @@ def build_graph_orchestrator(
         "agent", should_continue, {"tools": "tools", "finalize": "finalize"}
     )
     g.add_edge("tools", "agent")  # <-- the loop back
-    g.add_edge("finalize", END)
+    # In a sequence, loop back to dispatch for the next step; otherwise end.
+    g.add_conditional_edges("finalize", route_after_finalize, {"dispatch": "dispatch", END: END})
 
     # The graph is left *uncompiled*: GraphOrchestrator compiles it per call with
     # a freshly-opened checkpointer (see its docstring) so a persistent SQLite
@@ -943,6 +1044,11 @@ class GraphOrchestrator:
             "result": "",
             "error": "",
             "progress": [],
+            # Complex-prompt step queue — reset so a new turn never re-runs a prior
+            # turn's steps.
+            "steps": [],
+            "step_index": 0,
+            "step_results": [],
             # Plan confirm-loop scratch (locked_plan persists, so it's NOT reset).
             "plan_feedback": "",
             "pending_plan": None,

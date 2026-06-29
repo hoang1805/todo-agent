@@ -34,10 +34,9 @@ def render_sidebar():
     if st.sidebar.button("🧹 Clear Agent Cache", use_container_width=True):
         st.cache_data.clear()
         st.cache_resource.clear()
-        if "messages" in st.session_state:
-            st.session_state.messages = []
-        if "thread_id" in st.session_state:
-            del st.session_state.thread_id
+        # Drop all chat sessions; they're recreated fresh on the next render.
+        for key in ("sessions", "active_sid"):
+            st.session_state.pop(key, None)
         st.sidebar.success("✨ Memory cleared successfully!")
 
 

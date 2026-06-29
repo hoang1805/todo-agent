@@ -18,6 +18,84 @@ if TYPE_CHECKING:
     from models.skill import Skill
 
 
+# ---------------------------------------------------------------------------
+# Chat sessions — each chat window is one session: its own message history and
+# ``thread_id`` (the planner/agent checkpointer key), so conversations, locked
+# plans, and memory stay isolated. The orchestrator itself is shared and keyed by
+# thread_id, so only the UI needs to track the set of sessions.
+# ---------------------------------------------------------------------------
+
+
+def _new_chat() -> str:
+    """Create a fresh chat session and make it active; returns its id."""
+    sid = str(uuid.uuid4())
+    st.session_state.sessions.insert(0, {
+        "sid": sid,
+        "title": "New chat",
+        "messages": [],          # display dicts {role, content, [steps]}
+        "thread_id": sid,        # checkpointer key — isolates this chat's state
+        "pending": None,         # outstanding human-in-the-loop approval, if any
+        "edit_errors": None,     # field errors from a rejected CRUD review
+    })
+    st.session_state.active_sid = sid
+    return sid
+
+
+def _ensure_sessions() -> None:
+    """Make sure there's at least one chat session to render."""
+    if "sessions" not in st.session_state:
+        st.session_state.sessions = []
+        st.session_state.active_sid = None
+    if not st.session_state.sessions:
+        _new_chat()
+
+
+def _active_session() -> dict:
+    """The session dict for the currently selected chat window."""
+    for s in st.session_state.sessions:
+        if s["sid"] == st.session_state.active_sid:
+            return s
+    return st.session_state.sessions[0]
+
+
+def _delete_session(sid: str) -> None:
+    """Remove a chat; fall back to another (or a fresh one) if it was active."""
+    st.session_state.sessions = [s for s in st.session_state.sessions if s["sid"] != sid]
+    if not st.session_state.sessions:
+        _new_chat()
+    elif st.session_state.active_sid == sid:
+        st.session_state.active_sid = st.session_state.sessions[0]["sid"]
+
+
+def _title_from(prompt: str) -> str:
+    """A short chat title derived from its first message."""
+    title = " ".join((prompt or "").split())
+    return (title[:32] + "…") if len(title) > 32 else (title or "New chat")
+
+
+def _render_session_sidebar() -> None:
+    """Render the chat list (new / switch / delete) into the sidebar."""
+    with st.sidebar:
+        st.markdown("### 💬 Chats")
+        if st.button("➕ New chat", use_container_width=True, key="new_chat_btn"):
+            _new_chat()
+            st.rerun()
+        for s in st.session_state.sessions:
+            is_active = s["sid"] == st.session_state.active_sid
+            open_col, del_col = st.columns([5, 1])
+            if open_col.button(
+                s["title"] or "New chat",
+                key=f"open_{s['sid']}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+            ):
+                st.session_state.active_sid = s["sid"]
+                st.rerun()
+            if del_col.button("🗑", key=f"del_{s['sid']}", help="Delete this chat"):
+                _delete_session(s["sid"])
+                st.rerun()
+        st.divider()
+
 
 def render_main_view(
     model: str,
@@ -66,23 +144,21 @@ def render_main_view(
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Session state
-    if "messages" not in st.session_state:
-        st.session_state.messages = []          # display dicts {role, content}
-    if "thread_id" not in st.session_state:
-        st.session_state.thread_id = str(uuid.uuid4())
+    # Multiple chat windows: each session keeps its own history + thread_id, so
+    # conversations / locked plans / memory don't bleed across chats.
+    _ensure_sessions()
+    _render_session_sidebar()
+    sess = _active_session()
 
-    # Render chat history (including the persisted step trace for planner turns).
-    for message in st.session_state.messages:
+    # Render this chat's history (incl. the persisted step trace for planner turns).
+    for message in sess["messages"]:
         with st.chat_message(message["role"]):
             if message.get("steps"):
                 _render_steps(st, message["steps"])
             st.markdown(message["content"])
 
     # Pending human-in-the-loop approval (Planner mode) — render until resolved.
-    awaiting_approval = mode == PLANNER_MODE and bool(
-        st.session_state.get("planner_pending")
-    )
+    awaiting_approval = mode == PLANNER_MODE and bool(sess.get("pending"))
     if awaiting_approval:
         _render_approval_panel(_get_planner(tools, model, temperature), tools)
 
@@ -94,7 +170,9 @@ def render_main_view(
         else "Ask your agent (e.g., What should I do today?)",
         disabled=awaiting_approval,
     ):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        if not sess["messages"]:
+            sess["title"] = _title_from(prompt)   # name the chat from its first message
+        sess["messages"].append({"role": "user", "content": prompt})
 
         if mode == PLANNER_MODE:
             # The planner may pause for approval, so route through session state
@@ -111,18 +189,16 @@ def render_main_view(
             with st.spinner("Agent is thinking…", show_time=True):
                 if mode == "Streaming":
                     response = _stream_response(
-                        prompt, skills, tools, model, temperature,
-                        st.session_state.thread_id,
+                        prompt, skills, tools, model, temperature, sess["thread_id"],
                     )
                 else:
                     response = run_task_agent(
-                        prompt, skills, tools, model, temperature,
-                        st.session_state.thread_id,
+                        prompt, skills, tools, model, temperature, sess["thread_id"],
                     )
                     st.markdown(response)
 
-        # Append this turn to the UI store
-        st.session_state.messages.append({"role": "ai", "content": response})
+        # Append this turn to the active chat's store
+        sess["messages"].append({"role": "ai", "content": response})
 
 
 # ---------------------------------------------------------------------------
@@ -236,21 +312,19 @@ def _consume_planner_result(result, steps: list[str] | None = None) -> None:
     *steps* (the trace collected during this run) is stored on the message so it
     re-renders in chat history after the rerun instead of vanishing.
     """
+    sess = _active_session()
     # A resolved/new turn invalidates any field errors from a previous review.
-    st.session_state.pop("planner_edit_errors", None)
+    sess["edit_errors"] = None
     if result.status == "done":
-        st.session_state.planner_pending = None
-        st.session_state.messages.append(
+        sess["pending"] = None
+        sess["messages"].append(
             {"role": "ai", "content": _as_markdown(result.text), "steps": steps}
         )
         return
 
     intr = result.interrupt or {}
-    st.session_state.planner_pending = {
-        "thread_id": result.thread_id,
-        "interrupt": intr,
-    }
-    st.session_state.messages.append(
+    sess["pending"] = {"thread_id": result.thread_id, "interrupt": intr}
+    sess["messages"].append(
         {
             "role": "ai",
             "content": (
@@ -276,7 +350,7 @@ def _start_planner_turn(planner, prompt: str) -> None:
         result = planner.start(
             prompt,
             date=get_today_date.invoke({}),
-            thread_id=st.session_state.thread_id,
+            thread_id=_active_session()["thread_id"],
             on_step=on_step,
         )
     _consume_planner_result(result, steps)
@@ -431,7 +505,7 @@ def _render_approval_panel(planner, tools: list[BaseTool]) -> None:
     priority, category, … — before submitting. Operation/plumbing fields are
     hidden and the tool itself cannot be swapped.
     """
-    pending = st.session_state.planner_pending
+    pending = _active_session()["pending"]
     intr = pending["interrupt"]
     # Plan confirmation uses a lighter accept/suggest panel, not the edit table.
     if intr.get("type") == "plan_approval":
@@ -474,7 +548,7 @@ def _render_approval_panel(planner, tools: list[BaseTool]) -> None:
     )
 
     # Show errors from a previous (rejected) submit and point at the bad fields.
-    errors = st.session_state.get("planner_edit_errors") or {}
+    errors = _active_session().get("edit_errors") or {}
     if errors:
         lines = "\n".join(
             f"- **{field}**: {'; '.join(msgs)}" for field, msgs in errors.items()
@@ -506,9 +580,9 @@ def _render_approval_panel(planner, tools: list[BaseTool]) -> None:
         # rather than the change being silently dropped downstream.
         validation_errors = _validate_mutation(new_args) if mutation else {}
         if validation_errors:
-            st.session_state.planner_edit_errors = validation_errors
+            _active_session()["edit_errors"] = validation_errors
             st.rerun()
-        st.session_state.pop("planner_edit_errors", None)
+        _active_session()["edit_errors"] = None
         with _planner_progress("Applying…") as (on_step, steps):
             result = planner.resume(
                 pending["thread_id"], {"action": "edit", "args": new_args}, on_step=on_step

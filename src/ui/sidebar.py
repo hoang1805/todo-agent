@@ -24,19 +24,21 @@ def render_sidebar():
 
     mode = st.sidebar.selectbox(
         "Agent Mode",
-        options=["Normal", "Streaming"],
+        options=["Planner (Multi-Agent)", "Streaming", "Normal"],
+        help=(
+            "Planner: the multi-agent orchestrator (plan / summarize / multi-step). "
+            "Streaming & Normal: the general chat assistant (with MCP tools)."
+        ),
     )
 
     if st.sidebar.button("🧹 Clear Agent Cache", use_container_width=True):
         st.cache_data.clear()
         st.cache_resource.clear()
-        if "messages" in st.session_state:
-            st.session_state.messages = []
-        if "thread_id" in st.session_state:
-            from agents.ollama_agent import clear_agent_thread
-            clear_agent_thread(model_name, temperature, st.session_state.thread_id)
-            del st.session_state.thread_id
+        # Drop all chat sessions; they're recreated fresh on the next render.
+        for key in ("sessions", "active_sid"):
+            st.session_state.pop(key, None)
         st.sidebar.success("✨ Memory cleared successfully!")
+
 
     return {
         "model": model_name,

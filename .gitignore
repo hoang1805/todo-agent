@@ -11,3 +11,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# LangGraph persistent checkpointer
+*.db
+agent-checkpoints.db*
+
+# Generated graph visualizations
+planner_graph.*

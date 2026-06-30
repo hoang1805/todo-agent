@@ -66,7 +66,7 @@ class RAGAgent:
             )
             if decision.sufficient:
                 step("✅ Enough to answer — composing a grounded response")
-                return self._generate(query, collected)
+                return self._finish(query, collected)
 
             current_query = decision.next_query or current_query
             source = decision.next_source or source
@@ -77,9 +77,17 @@ class RAGAgent:
         logger.info("[rag] stopped after %d iterations (%d chunks)", self.MAX_ITERATIONS, len(collected))
         if collected:
             step("⏱️ Out of retries — answering from what I found (with a caveat)")
-            return self._generate(query, collected)
+            return self._finish(query, collected)
         step("🚫 Nothing relevant found in your logs or documents")
         return "I couldn't find anything relevant in your logs or documents."
+
+    def _finish(self, query: str, collected: list[DataChunk]) -> str:
+        """Generate the answer, then verify it's grounded in the context (output guardrail)."""
+        from core.services.guardrails import check_output
+
+        answer = self._generate(query, collected)
+        context = "\n".join(text for _, text in _generation_texts(collected))
+        return check_output(answer, context)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +180,24 @@ def make_mcp_retriever(tools: list) -> Retriever:
 _SUFFICIENT_THRESHOLD = 0.2
 
 
+def _generation_texts(collected: list[DataChunk]) -> list[tuple[str, str]]:
+    """``(source_type, text)`` for generation, ranked by score.
+
+    For parent-child chunks the child matched but generation should see the whole
+    parent, so prefer ``metadata['parent_text']``; de-duplicate so several children
+    of one parent collapse to that parent once.
+    """
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for c in sorted(collected, key=lambda c: c.score, reverse=True):
+        text = c.metadata.get("parent_text") or c.text
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append((c.source_type, text))
+    return out
+
+
 def heuristic_judge(query: str, collected: list[DataChunk]) -> RetrievalDecision:
     """No-LLM judge: sufficient if a reasonably-similar chunk exists, else reformulate.
 
@@ -193,8 +219,7 @@ def extractive_generate(query: str, collected: list[DataChunk]) -> str:
     """No-LLM answer: surface the most relevant stored chunks, grounded only in them."""
     if not collected:
         return "I couldn't find anything relevant in your logs or documents."
-    top = sorted(collected, key=lambda c: c.score, reverse=True)[:3]
-    lines = "\n".join(f"- {c.text}" for c in top)
+    lines = "\n".join(f"- {text}" for _, text in _generation_texts(collected)[:3])
     return f"Here's what I found in your memory:\n{lines}"
 
 
@@ -226,8 +251,13 @@ def llm_generate(query: str, collected: list[DataChunk], model_name: str, temper
     from core.services.llm_client import create_ollama_model
     from core.services.prompts import load_prompt
 
+    from core.services.guardrails import wrap_context
+
     llm = create_ollama_model(model_name, temperature, with_thinking=False)
-    context = "\n\n".join(f"[{c.source_type}] {c.text}" for c in collected) or "(nothing retrieved)"
+    # Injection defense: fence retrieved data in delimited tags; the system prompt
+    # tells the model content inside them is data to reference, not instructions.
+    blocks = [f"[{src}] {text}" for src, text in _generation_texts(collected)]
+    context = wrap_context(blocks) if blocks else "(nothing retrieved)"
     response = llm.invoke([
         SystemMessage(content=load_prompt("rag_generate_system")),
         HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}"),

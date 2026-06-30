@@ -271,6 +271,16 @@ class Orchestrator:
         self.classifier = classifier
 
     def run(self, user_input: str, date: str | None = None) -> str:
+        """Guardrail-checked entry: check input, route, check output."""
+        from core.services.guardrails import GuardrailError, check_input, check_output
+
+        try:
+            user_input = check_input(user_input)
+        except GuardrailError as exc:
+            return exc.message
+        return check_output(self._route(user_input, date))
+
+    def _route(self, user_input: str, date: str | None = None) -> str:
         """Classify the request and route it, returning text for the user."""
         intent = self.classifier(user_input)
         logger.info("Orchestrator classified intent=%s", intent.value)

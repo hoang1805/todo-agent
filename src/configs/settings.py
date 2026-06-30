@@ -41,3 +41,7 @@ CHECKPOINT_DB = os.getenv("CHECKPOINT_DB", str(_SRC_DIR.parent / "agent-checkpoi
 # planner logs each graph node and the state it produces, and the app raises the
 # agent loggers to INFO so the trace appears in the terminal.
 TRACE = bool(os.getenv("PLANNER_TRACE"))
+
+# Persisted, listable multiturn chat history (SQLite), owned by the orchestrator.
+# Survives restarts; separate from the LangGraph checkpointer (interrupt/resume).
+HISTORY_DB = os.getenv("HISTORY_DB", str(_SRC_DIR.parent / "chat-history.db"))

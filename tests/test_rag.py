@@ -73,7 +73,8 @@ def test_loop_terminates_at_max_iterations_and_answers_honestly():
         generate=generate,
     )
     out = agent.run("unanswerable")
-    assert out == "best effort from what I have"
+    # The groundedness guardrail may append a caveat; the core answer is still there.
+    assert out.startswith("best effort from what I have")
     assert gen_calls["n"] == 1  # generated once, after the cap — not looping forever
 
 

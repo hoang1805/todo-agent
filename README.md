@@ -90,6 +90,17 @@ Orchestrator → formatted, time-blocked day
   ([`core/services/checkpoint.py`](src/core/services/checkpoint.py)), so a pending approval — and the
   conversation thread — can be resumed even after the process restarts. It falls back to an in-memory
   saver when the SQLite checkpointer isn't installed.
+- **Guardrails as a shared layer** ([`core/services/guardrails.py`](src/core/services/guardrails.py)).
+  Distinct from shape contracts: every turn passes `check_input` (before routing) and `check_output`
+  (before replying) at the orchestrator choke point. RAGAgent wraps retrieved chunks in delimited
+  `<context>` tags framed as *data, not instructions* (prompt-injection defense) and verifies its answer
+  is **grounded**; the planner self-checks its schedule (`sanity_check_schedule`) and falls back to the
+  deterministic planner on overlap/negative-duration; mutations stay confirm-gated.
+- **Persisted, listable chat history** ([`core/services/history.py`](src/core/services/history.py)).
+  A dedicated SQLite store (sessions + turns) the orchestrator owns: it injects a bounded sliding window
+  of recent turns each call (so follow-ups resolve) and persists every turn, so conversations **survive a
+  restart** and can be listed/resumed from the sidebar. (Separate from the checkpointer, which is for
+  interrupt/resume.)
 - **Two orchestrator implementations, same agents.** A plain-Python one
   ([`agents/orchestrator.py`](src/agents/orchestrator.py)) — a `match` on intent, clearest to read —
   and a LangGraph one ([`agents/graph_orchestrator.py`](src/agents/graph_orchestrator.py)) where each

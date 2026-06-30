@@ -97,6 +97,7 @@ from agents.planner_agent import (
     format_plan,
     parse_query_time,
     parse_workday,
+    plan_day,
     wants_replan,
     workday_with_appointments,
 )
@@ -105,6 +106,8 @@ from pydantic import ValidationError
 from agents.rag_agent import RAGAgent, make_rag_agent
 from agents.todo_agent import ContractError, MutationParser, TodoAgent
 from core.services.checkpoint import make_checkpointer_opener
+from core.services.guardrails import GuardrailError, check_input, check_output, sanity_check_schedule
+from core.services.history import History, get_history
 from core.services.prompts import load_prompt
 from core.tools.common_tools import make_common_tools
 from models.contract import CrudOp, DayPlan, TaskList, TaskMutation
@@ -234,6 +237,9 @@ class PlannerState(TypedDict):
     # tell a reject (→ re-plan) from a cancel (→ just finish). Reset each turn.
     confirm_action: NotRequired[str]
     notice: NotRequired[str]     # success line prepended to the re-planned result
+    # Sliding window of prior turns from the persisted history store, injected by
+    # the orchestrator so a follow-up ("the high-priority ones") resolves.
+    history: NotRequired[list[dict]]
     # `add_messages` makes this an append-only log — the agent⇄tools loop's memory.
     messages: Annotated[list[AnyMessage], add_messages]
     result: NotRequired[str]
@@ -279,6 +285,7 @@ def build_graph_orchestrator(
     memory_tools: list[BaseTool] | None = None,
     rag_agent: RAGAgent | None = None,
     memory_writer: "Callable[[str, str], None] | None" = None,
+    history: History | None = None,
     observe: bool = False,
 ):
     """Wire and compile the LangGraph orchestrator.
@@ -296,6 +303,17 @@ def build_graph_orchestrator(
     mutation_parser = mutation_parser or make_mutation_parser(model_name, temperature, use_llm)
     mutation_executor = mutation_executor or make_mutation_executor(tools)
     planner = planner or make_planner(model_name, temperature, use_llm)
+
+    def _safe_plan(task_list, wd, date=None):
+        """Plan, then self-check (guardrail): on overlap/negative-duration, fall
+        back to the deterministic planner so the agent never returns a broken schedule."""
+        plan = planner(task_list, wd, date)
+        issues = sanity_check_schedule(plan)
+        if issues:
+            logger.warning("planner self-check failed (%s); deterministic fallback.", issues)
+            plan = plan_day(task_list, workday=wd, date=date)
+        return plan
+
     appointment_parser = appointment_parser or make_appointment_parser(model_name, temperature, use_llm)
     decomposer = decomposer or make_decomposer(model_name, temperature, use_llm)
     # Memory tools (retrieve_*/remember) arrive in the same combined `tools` list,
@@ -459,7 +477,7 @@ def build_graph_orchestrator(
 
         # Fold in fixed-time commitments, then plan (LLM + safe fallback).
         wd = workday_with_appointments(wd, appointments)
-        plan = planner(TaskList.model_validate(state["tasks"]), wd, state.get("date"))
+        plan = _safe_plan(TaskList.model_validate(state["tasks"]), wd, state.get("date"))
         out: dict = {
             "result": format_plan(plan),
             "pending_plan": plan.model_dump(mode="json"),
@@ -563,7 +581,7 @@ def build_graph_orchestrator(
             wh = state.get("work_hours")
             wd = Workday(start=wh["start"], end=wh["end"], breaks=workday.breaks) if wh else workday
             wd = workday_with_appointments(wd, list(state.get("appointments") or []))
-            plan = planner(tasks, wd, state.get("date"))
+            plan = _safe_plan(tasks, wd, state.get("date"))
         return {"result": describe_plan_at_time(plan, when)}
 
     # -- complex path: decompose into single-intent steps, run each for real ----
@@ -692,8 +710,14 @@ def build_graph_orchestrator(
 
         if llm_with_tools is None:
             return {"messages": [AIMessage(content=_UNKNOWN_MSG)]}
+        # Inject the persisted-history window so a follow-up resolves against earlier turns.
+        convo = state.get("history") or []
+        system = system_text
+        if convo:
+            recent = "\n".join(f"{t['role']}: {t['content']}" for t in convo)
+            system += f"\n\n## Recent conversation (for context)\n{recent}"
         response = llm_with_tools.invoke(
-            [SystemMessage(content=system_text), *state["messages"]]
+            [SystemMessage(content=system), *state["messages"]]
         )
         return {"messages": [response]}
 
@@ -902,7 +926,8 @@ def build_graph_orchestrator(
     # The graph is left *uncompiled*: GraphOrchestrator compiles it per call with
     # a freshly-opened checkpointer (see its docstring) so a persistent SQLite
     # connection lives on the same event loop that runs the graph.
-    return GraphOrchestrator(g, make_checkpointer_opener(checkpointer_db))
+    history = history if history is not None else get_history()
+    return GraphOrchestrator(g, make_checkpointer_opener(checkpointer_db), history=history)
 
 
 @dataclass
@@ -929,9 +954,23 @@ class GraphOrchestrator:
     event loop (avoiding "connection bound to a closed loop" with ``asyncio.run``).
     """
 
-    def __init__(self, graph_def, open_checkpointer) -> None:
+    def __init__(self, graph_def, open_checkpointer, history: History | None = None) -> None:
         self._graph_def = graph_def
         self._open_checkpointer = open_checkpointer
+        self._history = history  # canonical, persisted conversation log (may be None)
+
+    # -- conversation history ----------------------------------------------
+
+    def list_sessions(self) -> list[dict]:
+        return self._history.list_sessions() if self._history else []
+
+    def get_turns(self, session_id: str) -> list[dict]:
+        return self._history.get_all_turns(session_id) if self._history else []
+
+    def _record_assistant(self, thread_id: str, result: "PlannerResult") -> None:
+        """Persist the assistant's reply once a turn completes (not while interrupted)."""
+        if self._history and result.status == "done" and result.text:
+            self._history.add_turn(thread_id, "assistant", result.text)
 
     # -- visualization ------------------------------------------------------
 
@@ -1026,8 +1065,23 @@ class GraphOrchestrator:
         live progress display); leave it ``None`` for the plain invoke path.
         """
         thread_id = thread_id or str(uuid.uuid4())
+        # Guardrail checkpoint #1 — every turn's input passes through here before
+        # any routing; a rejection short-circuits without invoking the graph.
+        try:
+            user_input = check_input(user_input)
+        except GuardrailError as exc:
+            return PlannerResult(status="done", thread_id=thread_id, text=exc.message)
+        # History: fetch the recent window (prior turns) to inject, then record the
+        # user's message. The orchestrator owns this, on every turn.
+        history_window: list[dict] = []
+        if self._history is not None:
+            # Title a new session by its first message (INSERT-OR-IGNORE keeps it stable).
+            self._history.ensure_session(thread_id, title=user_input[:48])
+            history_window = self._history.get_recent_turns(thread_id)
+            self._history.add_turn(thread_id, "user", user_input)
         payload = {
             "user_input": user_input,
+            "history": history_window,
             "date": date,
             # `messages` is append-only — the conversation memory we keep.
             "messages": [HumanMessage(content=user_input)],
@@ -1053,7 +1107,9 @@ class GraphOrchestrator:
             "plan_feedback": "",
             "pending_plan": None,
         }
-        return self._interpret(self._drive(payload, thread_id, on_step), thread_id)
+        result = self._interpret(self._drive(payload, thread_id, on_step), thread_id)
+        self._record_assistant(thread_id, result)
+        return result
 
     def resume(
         self,
@@ -1067,7 +1123,9 @@ class GraphOrchestrator:
         "reason": "..."}``, or ``{"action": "edit", "args": {...}}``. Pass
         *on_step* to stream the post-approval steps (execute → re-plan, …).
         """
-        return self._interpret(self._drive(Command(resume=decision), thread_id, on_step), thread_id)
+        result = self._interpret(self._drive(Command(resume=decision), thread_id, on_step), thread_id)
+        self._record_assistant(thread_id, result)
+        return result
 
     def _interpret(self, state: dict, thread_id: str) -> PlannerResult:
         interrupts = state.get("__interrupt__")
@@ -1075,8 +1133,11 @@ class GraphOrchestrator:
             return PlannerResult(
                 status="interrupted", thread_id=thread_id, interrupt=interrupts[0].value
             )
+        # Guardrail checkpoint #2 — every final answer passes through here before
+        # it reaches the user (basic safety pass at the orchestrator level; the
+        # RAG-specific groundedness check runs inside RAGAgent where context exists).
         return PlannerResult(
-            status="done", thread_id=thread_id, text=state.get("result", "")
+            status="done", thread_id=thread_id, text=check_output(state.get("result", ""))
         )
 
     def run(self, user_input: str, date: str | None = None) -> str:

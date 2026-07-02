@@ -8,11 +8,16 @@ Schema (designed here; reasoning below):
 
     sessions(id TEXT PRIMARY KEY, title TEXT, created_at TEXT)
     turns(id INTEGER PK AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, ts TEXT)
+    documents(id INTEGER PK AUTOINCREMENT, session_id TEXT, name TEXT, kind TEXT,
+              ref TEXT, strategy TEXT, chunks INTEGER, ts TEXT)
 
-Two tables: one **session** row per conversation so they can be listed and resumed,
-and an ordered **turn** log keyed by ``session_id`` (autoincrement ``id`` gives a
-reliable order without depending on timestamp resolution). Reads use a **sliding
-window** (:meth:`get_recent_turns`) so only the last few turns are injected per call.
+Three tables: one **session** row per conversation so they can be listed and resumed,
+an ordered **turn** log keyed by ``session_id`` (autoincrement ``id`` gives a
+reliable order without depending on timestamp resolution), and the **documents**
+ingested during a conversation (what was uploaded/fetched, which chunking strategy
+was applied) — the chunks themselves live in the memory MCP; this is the
+conversation-side record of *what* was ingested. Reads use a **sliding window**
+(:meth:`get_recent_turns`) so only the last few turns are injected per call.
 """
 
 from __future__ import annotations
@@ -49,6 +54,10 @@ class History:
                       "(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, "
                       "role TEXT, content TEXT, ts TEXT)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, id)")
+            c.execute("CREATE TABLE IF NOT EXISTS documents"
+                      "(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, "
+                      "name TEXT, kind TEXT, ref TEXT, strategy TEXT, chunks INTEGER, ts TEXT)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_docs_session ON documents(session_id, id)")
 
     def ensure_session(self, session_id: str, title: str | None = None) -> str:
         with self._conn() as c:
@@ -61,10 +70,24 @@ class History:
     def create_session(self, title: str | None = None) -> str:
         return self.ensure_session(str(uuid.uuid4()), title)
 
+    def rename_session(self, session_id: str, title: str) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
+
+    def delete_session(self, session_id: str) -> None:
+        """Remove a conversation entirely — its turns, document records, and row."""
+        with self._conn() as c:
+            c.execute("DELETE FROM turns WHERE session_id = ?", (session_id,))
+            c.execute("DELETE FROM documents WHERE session_id = ?", (session_id,))
+            c.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
     def list_sessions(self) -> list[dict]:
+        """All conversations, most recently *active* first (new turns bump a session up)."""
         with self._conn() as c:
             rows = c.execute(
-                "SELECT id, title, created_at FROM sessions ORDER BY created_at DESC"
+                "SELECT s.id, s.title, s.created_at FROM sessions s "
+                "LEFT JOIN turns t ON t.session_id = s.id "
+                "GROUP BY s.id ORDER BY COALESCE(MAX(t.id), 0) DESC, s.created_at DESC"
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -91,6 +114,36 @@ class History:
         with self._conn() as c:
             rows = c.execute(
                 "SELECT role, content, ts FROM turns WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- documents ingested during a conversation ----------------------------
+
+    def add_document(
+        self, session_id: str, name: str, kind: str, ref: str,
+        strategy: str | None = None, chunks: int = 0,
+    ) -> None:
+        """Record that a document was ingested in this conversation.
+
+        ``kind`` is ``"file"`` or ``"url"``; ``ref`` the filename/URL; *strategy* and
+        *chunks* echo what the memory MCP reported, so the conversation shows not
+        just *what* was ingested but *how* it was chunked.
+        """
+        self.ensure_session(session_id)
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO documents(session_id, name, kind, ref, strategy, chunks, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session_id, name, kind, ref, strategy, chunks, _now()),
+            )
+
+    def get_documents(self, session_id: str) -> list[dict]:
+        """The documents ingested in this conversation, in ingestion order."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT name, kind, ref, strategy, chunks, ts FROM documents "
+                "WHERE session_id = ? ORDER BY id",
                 (session_id,),
             ).fetchall()
         return [dict(r) for r in rows]

@@ -552,12 +552,22 @@ def build_graph_orchestrator(
         from agents.orchestrator import _match_task
 
         tasks = TaskList.model_validate(state["tasks"])
-        out: dict = {"result": format_detail(tasks, state["user_input"])}
         # Remember which task this was about so a follow-up edit can refer to it.
         task = _match_task(tasks, state["user_input"])
         if task is not None:
-            out["focus_task"] = {"id": task.id, "title": task.title}
-        return out
+            return {
+                "result": format_detail(tasks, state["user_input"]),
+                "focus_task": {"id": task.id, "title": task.title},
+            }
+        # "Tell me about X" where X isn't a task: the user may mean something in
+        # their documents/logs (e.g. an entity from an ingested file) — ask the
+        # RAG agent before giving up, and only fall back to the task-list hint
+        # when memory has nothing either.
+        steps = ["ℹ️ No task matches — checking your documents and logs instead"]
+        answer = rag_agent.run(state["user_input"], on_step=steps.append)
+        if answer and not answer.startswith("I couldn't find anything relevant"):
+            return {"result": answer, "progress": steps}
+        return {"result": format_detail(tasks, state["user_input"]), "progress": steps}
 
     def run_at_time(state: PlannerState) -> dict:
         """Answer "which task do I have at <time>?" against the plan.

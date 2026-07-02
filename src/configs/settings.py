@@ -45,3 +45,15 @@ TRACE = bool(os.getenv("PLANNER_TRACE"))
 # Persisted, listable multiturn chat history (SQLite), owned by the orchestrator.
 # Survives restarts; separate from the LangGraph checkpointer (interrupt/resume).
 HISTORY_DB = os.getenv("HISTORY_DB", str(_SRC_DIR.parent / "chat-history.db"))
+
+# LLM-enhanced guardrails: a screening model reviews user input and verifies that
+# RAG answers are grounded, on top of (never instead of) the deterministic checks
+# in guardrails.py. Any model failure falls back to the deterministic layer, so
+# switching this off — or Ollama being down — never blocks the app.
+GUARDRAIL_MODEL = os.getenv("GUARDRAIL_MODEL", "ministral-3:14b-cloud")
+GUARDRAIL_USE_LLM = os.getenv("GUARDRAIL_USE_LLM", "1").lower() in ("1", "true", "yes")
+
+# Debug: emit the FULL text of every retrieved chunk (and its parent context)
+# into the RAG step trace — visible in the UI steps box and, with PLANNER_TRACE,
+# the terminal. Off by default: it makes traces long.
+RAG_DEBUG = bool(os.getenv("RAG_DEBUG"))

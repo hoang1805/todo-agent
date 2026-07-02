@@ -262,6 +262,40 @@ def test_recall_streams_rag_progress_steps():
     assert seen == ["🔎 searching", "✅ enough"]  # the loop's phases surface live
 
 
+def test_detail_of_a_non_task_falls_back_to_rag():
+    # "tell me about the detail of agent AGT-01": detail intent, but AGT-01 is no
+    # task — it lives in the user's documents. The detail node must consult the
+    # RAG agent instead of giving up with the task-list hint.
+    class _FakeRag:
+        def run(self, query, on_step=None):
+            return "AGT-01 is the intake agent described in your architecture doc."
+
+    go = build_graph_orchestrator(tools=[], model_name="dummy", use_llm=False, rag_agent=_FakeRag())
+    out = go.run("tell me about the detail of agent AGT-01")
+    assert "intake agent" in out
+    assert "couldn't find a task" not in out
+
+
+def test_detail_of_a_non_task_keeps_task_hint_when_rag_is_empty_too():
+    class _EmptyRag:
+        def run(self, query, on_step=None):
+            return "I couldn't find anything relevant in your logs or documents."
+
+    go = build_graph_orchestrator(tools=[], model_name="dummy", use_llm=False, rag_agent=_EmptyRag())
+    out = go.run("tell me about the detail of agent AGT-01")
+    assert "couldn't find a task" in out  # actionable: lists the real task names
+
+
+def test_detail_of_a_real_task_still_answers_directly():
+    class _MustNotRun:
+        def run(self, query, on_step=None):
+            raise AssertionError("RAG must not run when a task matches")
+
+    go = build_graph_orchestrator(tools=[], model_name="dummy", use_llm=False, rag_agent=_MustNotRun())
+    out = go.run("show me the detail of the Q3 report task")
+    assert "Priority" in out  # the task card, straight from the task list
+
+
 def test_rejecting_with_an_appointment_suggestion_blocks_that_time():
     # Regression: a reject suggestion that is a fixed-time event must register as
     # an appointment (block that slot) — not be parsed as the working-hours window

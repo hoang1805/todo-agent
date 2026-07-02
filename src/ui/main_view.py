@@ -19,39 +19,73 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Chat sessions — each chat window is one session: its own message history and
-# ``thread_id`` (the planner/agent checkpointer key), so conversations, locked
-# plans, and memory stay isolated. The orchestrator itself is shared and keyed by
-# thread_id, so only the UI needs to track the set of sessions.
+# Conversations — ONE concept, persisted. Each conversation is a history-store
+# session: its ``session_id`` is also the planner/agent checkpointer thread_id,
+# so messages, locked plans, and ingested documents all key off the same id.
+# On startup (or a browser refresh) the list is hydrated from the SQLite history
+# store, so conversations survive restarts; ``st.session_state`` only caches the
+# hydrated list plus per-run extras the store doesn't keep (step traces, a
+# pending approval panel).
 # ---------------------------------------------------------------------------
 
 
+def _get_history():
+    from core.services.history import get_history
+
+    return get_history()
+
+
+def _load_conversations() -> list[dict]:
+    """Hydrate the conversation list (and each one's turns) from the history DB."""
+    history = _get_history()
+    conversations = []
+    for sess in history.list_sessions():
+        conversations.append({
+            "sid": sess["id"],
+            "title": sess["title"] or "New conversation",
+            "messages": [
+                {"role": "user" if t["role"] == "user" else "ai", "content": t["content"]}
+                for t in history.get_all_turns(sess["id"])
+            ],
+            "thread_id": sess["id"],   # checkpointer key — same id everywhere
+            "pending": None,           # outstanding human-in-the-loop approval, if any
+            "edit_errors": None,       # field errors from a rejected CRUD review
+        })
+    return conversations
+
+
 def _new_chat() -> str:
-    """Create a fresh chat session and make it active; returns its id."""
+    """Create a fresh conversation and make it active; returns its id.
+
+    The history-store row is created lazily on the first message or document, so
+    an untouched empty conversation doesn't pile up rows across refreshes.
+    """
     sid = str(uuid.uuid4())
     st.session_state.sessions.insert(0, {
         "sid": sid,
-        "title": "New chat",
-        "messages": [],          # display dicts {role, content, [steps]}
-        "thread_id": sid,        # checkpointer key — isolates this chat's state
-        "pending": None,         # outstanding human-in-the-loop approval, if any
-        "edit_errors": None,     # field errors from a rejected CRUD review
+        "title": "New conversation",
+        "messages": [],
+        "thread_id": sid,
+        "pending": None,
+        "edit_errors": None,
     })
     st.session_state.active_sid = sid
     return sid
 
 
 def _ensure_sessions() -> None:
-    """Make sure there's at least one chat session to render."""
+    """Hydrate the conversation list from the store; make sure one is active."""
     if "sessions" not in st.session_state:
-        st.session_state.sessions = []
-        st.session_state.active_sid = None
+        st.session_state.sessions = _load_conversations()
+        st.session_state.active_sid = (
+            st.session_state.sessions[0]["sid"] if st.session_state.sessions else None
+        )
     if not st.session_state.sessions:
         _new_chat()
 
 
 def _active_session() -> dict:
-    """The session dict for the currently selected chat window."""
+    """The conversation dict for the currently selected chat window."""
     for s in st.session_state.sessions:
         if s["sid"] == st.session_state.active_sid:
             return s
@@ -59,7 +93,8 @@ def _active_session() -> dict:
 
 
 def _delete_session(sid: str) -> None:
-    """Remove a chat; fall back to another (or a fresh one) if it was active."""
+    """Delete a conversation — from the store too, not just the sidebar list."""
+    _get_history().delete_session(sid)
     st.session_state.sessions = [s for s in st.session_state.sessions if s["sid"] != sid]
     if not st.session_state.sessions:
         _new_chat()
@@ -68,33 +103,146 @@ def _delete_session(sid: str) -> None:
 
 
 def _title_from(prompt: str) -> str:
-    """A short chat title derived from its first message."""
+    """A short conversation title derived from its first message."""
     title = " ".join((prompt or "").split())
-    return (title[:32] + "…") if len(title) > 32 else (title or "New chat")
+    return (title[:32] + "…") if len(title) > 32 else (title or "New conversation")
+
+
+def _set_title_on_first_message(sess: dict, prompt: str) -> None:
+    """Name the conversation from its first message, in the store as well.
+
+    Runs *before* the orchestrator's ``ensure_session`` so the row is created
+    with (then kept at) the UI's title.
+    """
+    if sess["messages"]:
+        return
+    sess["title"] = _title_from(prompt)
+    history = _get_history()
+    history.ensure_session(sess["sid"], sess["title"])
+    history.rename_session(sess["sid"], sess["title"])
 
 
 def _render_session_sidebar() -> None:
-    """Render the chat list (new / switch / delete) into the sidebar."""
+    """Render the conversation list (new / resume / delete) into the sidebar."""
     with st.sidebar:
-        st.markdown("### 💬 Chats")
-        if st.button("➕ New chat", use_container_width=True, key="new_chat_btn"):
+        st.markdown("### 💬 Conversations")
+        if st.button("➕ New conversation", use_container_width=True, key="new_chat_btn"):
             _new_chat()
             st.rerun()
         for s in st.session_state.sessions:
             is_active = s["sid"] == st.session_state.active_sid
             open_col, del_col = st.columns([5, 1])
             if open_col.button(
-                s["title"] or "New chat",
+                s["title"] or "New conversation",
                 key=f"open_{s['sid']}",
                 use_container_width=True,
                 type="primary" if is_active else "secondary",
             ):
                 st.session_state.active_sid = s["sid"]
                 st.rerun()
-            if del_col.button("🗑", key=f"del_{s['sid']}", help="Delete this chat"):
+            if del_col.button("🗑", key=f"del_{s['sid']}", help="Delete this conversation"):
                 _delete_session(s["sid"])
                 st.rerun()
         st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Document ingestion — load a file (upload or URL) into the memory MCP so the
+# RAG agent can retrieve it. Chunking/embedding happen server-side in remember().
+# Each document belongs to the conversation it was ingested in: its chunks are
+# tagged with the session_id, and the history store records what was digested so
+# the conversation can show it (and it survives restarts like the turns do).
+# ---------------------------------------------------------------------------
+
+
+def _ingest_document(ingest, sid: str, text: str, name: str, kind: str, ref: str) -> None:
+    """Guardrail-check *text*, send it through the memory MCP, record it, report inline."""
+    from core.services.guardrails import GuardrailError, check_document
+
+    try:
+        text, warnings = check_document(text, name)
+    except GuardrailError as exc:
+        st.sidebar.error(exc.message)
+        return
+    for warning in warnings:
+        st.sidebar.warning(warning)
+
+    metadata = {"session_id": sid, kind: ref, "name": name}
+    result = ingest(text, metadata)
+    if result.get("ok"):
+        _get_history().add_document(
+            sid, name=name, kind=kind, ref=ref,
+            strategy=result.get("strategy"), chunks=len(result.get("ids") or []),
+        )
+        st.sidebar.success(
+            f"Ingested **{name}** — `{result.get('strategy')}`, "
+            f"{len(result.get('ids') or [])} chunk(s). Ask a recall question to use it "
+            "(e.g. *“what do my documents say about …?”*)."
+        )
+    else:
+        st.sidebar.error(f"Could not ingest {name}: {result.get('error', 'unknown error')}")
+
+
+def _render_document_panel(tools: list[BaseTool], sid: str) -> None:
+    """Sidebar panel: this conversation's documents — what's been digested, plus
+    adding more from a local file or a web URL.
+
+    Both paths funnel into the memory MCP ``remember`` tool. Hidden entirely when
+    no memory server is connected (no ``remember`` tool → nothing could be stored).
+    """
+    from agents.rag_agent import make_document_ingestor
+
+    ingest = make_document_ingestor(tools)
+    if ingest is None:
+        return
+
+    # Uploads already sent — Streamlit re-delivers the uploader's files on every
+    # rerun, so remember (per conversation) what's been ingested to avoid duplicates.
+    done: set[tuple[str, str, int]] = st.session_state.setdefault("ingested_docs", set())
+
+    with st.sidebar.expander("📄 Documents in this conversation"):
+        uploads = st.file_uploader(
+            "Upload a text file",
+            type=["txt", "md", "markdown", "rst", "csv", "log"],
+            accept_multiple_files=True,
+            key=f"doc_uploader_{sid}",   # per-conversation widget state
+        )
+        for upload in uploads or []:
+            key = (sid, upload.name, upload.size)
+            if key in done:
+                continue
+            text = upload.getvalue().decode("utf-8", errors="replace")
+            _ingest_document(ingest, sid, text, upload.name, kind="file", ref=upload.name)
+            done.add(key)
+
+        url = st.text_input(
+            "…or fetch a web page",
+            placeholder="https://example.com/notes",
+            key=f"doc_url_{sid}",
+        )
+        if st.button("🌐 Fetch & ingest", use_container_width=True, key=f"fetch_url_{sid}") and url:
+            from core.services.web_loader import LoadError, fetch_url_text
+
+            try:
+                with st.spinner("Fetching…"):
+                    title, text = fetch_url_text(url)
+            except LoadError as exc:
+                st.sidebar.error(str(exc))
+            else:
+                _ingest_document(ingest, sid, text, title, kind="url", ref=url)
+
+        # Rendered after ingestion so a just-added document shows immediately.
+        docs = _get_history().get_documents(sid)
+        if docs:
+            st.markdown("**Digested here:**")
+            for doc in docs:
+                if doc["kind"] == "url":
+                    label = f"🔗 [{doc['name']}]({doc['ref']})"
+                else:
+                    label = f"📄 {doc['name']}"
+                st.markdown(f"{label} — `{doc['strategy']}`, {doc['chunks']} chunk(s)")
+        else:
+            st.caption("Nothing digested in this conversation yet.")
 
 
 def render_main_view(
@@ -149,6 +297,7 @@ def render_main_view(
     _ensure_sessions()
     _render_session_sidebar()
     sess = _active_session()
+    _render_document_panel(tools, sess["sid"])
 
     # Render this chat's history (incl. the persisted step trace for planner turns).
     for message in sess["messages"]:
@@ -170,15 +319,15 @@ def render_main_view(
         else "Ask your agent (e.g., What should I do today?)",
         disabled=awaiting_approval,
     ):
-        if not sess["messages"]:
-            sess["title"] = _title_from(prompt)   # name the chat from its first message
+        _set_title_on_first_message(sess, prompt)
         sess["messages"].append({"role": "user", "content": prompt})
 
         if mode == PLANNER_MODE:
             # The planner may pause for approval, so route through session state
             # and rerun (the approval panel / result renders on the next pass).
             # Echo the prompt now and show the live step box in the reply bubble;
-            # both are re-rendered from history after the rerun.
+            # both are re-rendered from history after the rerun. Turn persistence
+            # is the orchestrator's job in this mode — it owns the history store.
             st.chat_message("user").markdown(prompt)
             with st.chat_message("assistant"):
                 _start_planner_turn(_get_planner(tools, model, temperature), prompt)
@@ -197,8 +346,13 @@ def render_main_view(
                     )
                     st.markdown(response)
 
-        # Append this turn to the active chat's store
+        # Append this turn to the active conversation — and persist it. In the
+        # chat modes no orchestrator writes history, so the UI does (same store,
+        # same session_id → the conversation survives a restart in every mode).
         sess["messages"].append({"role": "ai", "content": response})
+        history = _get_history()
+        history.add_turn(sess["sid"], "user", prompt)
+        history.add_turn(sess["sid"], "assistant", response)
 
 
 # ---------------------------------------------------------------------------

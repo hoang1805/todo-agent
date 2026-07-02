@@ -58,6 +58,8 @@ class RAGAgent:
             seen = {c.text for c in collected}
             collected.extend(c for c in chunks if c.text not in seen)
             step(f"📚 Got {len(chunks)} result(s); {len(collected)} gathered so far")
+            if _rag_debug():
+                _debug_chunks(chunks, step)
 
             decision = self._judge(query, collected)
             logger.info(
@@ -88,6 +90,25 @@ class RAGAgent:
         answer = self._generate(query, collected)
         context = "\n".join(text for _, text in _generation_texts(collected))
         return check_output(answer, context)
+
+
+def _rag_debug() -> bool:
+    try:
+        from configs import settings
+
+        return bool(settings.RAG_DEBUG)
+    except Exception:  # noqa: BLE001 — no settings (bare unit test) → off
+        return False
+
+
+def _debug_chunks(chunks: "list[DataChunk]", step: "Callable[[str], None]") -> None:
+    """RAG_DEBUG: emit every retrieved chunk's FULL text (and its parent context)
+    into the step trace, instead of just the result count."""
+    for c in chunks:
+        step(f"🧩 `[{c.source_type} · score {c.score:.2f}]` {c.text}")
+        parent = c.metadata.get("parent_text")
+        if parent and parent != c.text:
+            step(f"🪆 parent context → {parent}")
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +305,54 @@ def make_memory_writer(tools: list) -> "Callable[[str, str], None] | None":
             logger.warning("remember(%s) failed: %s", source_type, exc)
 
     return write
+
+
+def _coerce_remember_result(result: object) -> dict:
+    """Normalize a ``remember`` tool result to its ``{"ok": ..., ...}`` dict.
+
+    Like retrieval results, the dict may cross the MCP boundary as a JSON string
+    or wrapped in a text-content block — unwrap both; anything unrecognizable is
+    a structured failure, never an exception.
+    """
+    if isinstance(result, list) and result:  # MCP content blocks
+        first = result[0]
+        result = first.get("text") if isinstance(first, dict) else first
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (ValueError, TypeError):
+            return {"ok": False, "error": f"unexpected remember result: {result!r:.80}"}
+    if isinstance(result, dict):
+        return result
+    return {"ok": False, "error": f"unexpected remember result type: {type(result).__name__}"}
+
+
+def make_document_ingestor(tools: list) -> "Callable[[str, dict | None], dict] | None":
+    """Build a ``(text, metadata) -> result`` document ingestor over ``remember``.
+
+    The heavy lifting (adaptive chunking, embedding, storage) happens server-side
+    in the memory MCP; this just delivers the text and reports the outcome —
+    ``{"ok": True, "ids": [...], "strategy": ...}`` or a recoverable error dict.
+    Returns ``None`` when no memory server is connected, so the UI can hide the
+    upload panel instead of offering a dead control.
+    """
+    from agents.orchestrator import _run_coro
+
+    remember = {t.name: t for t in tools}.get("remember")
+    if remember is None:
+        return None
+
+    def ingest(text: str, metadata: dict | None = None) -> dict:
+        try:
+            raw = _run_coro(remember.ainvoke(
+                {"text": text, "source_type": "document", "metadata": metadata or {}}
+            ))
+            return _coerce_remember_result(raw)
+        except Exception as exc:  # noqa: BLE001 — surface a recoverable error
+            logger.warning("document ingest failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    return ingest
 
 
 def make_rag_agent(tools: list, model_name: str, temperature: float = 0.0, use_llm: bool = True) -> RAGAgent:

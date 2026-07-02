@@ -44,6 +44,45 @@ def test_sessions_are_isolated_and_listed():
     assert [t["content"] for t in h.get_all_turns(a)] == ["in A"]
 
 
+def test_documents_are_recorded_per_conversation_and_survive_restart():
+    db = _tmp_db()
+    h = History(db)
+    a, b = h.create_session("A"), h.create_session("B")
+    h.add_document(a, name="notes.txt", kind="file", ref="notes.txt",
+                   strategy="recursive", chunks=5)
+    h.add_document(a, name="Investment memo", kind="url",
+                   ref="https://carta.com/learn/", strategy="parent_child", chunks=40)
+
+    docs = History(db).get_documents(a)  # fresh instance = post-restart view
+    assert [d["name"] for d in docs] == ["notes.txt", "Investment memo"]
+    assert docs[1]["kind"] == "url" and docs[1]["chunks"] == 40
+    assert History(db).get_documents(b) == []  # scoped to their conversation
+
+
+def test_delete_session_removes_turns_documents_and_row():
+    h = History(_tmp_db())
+    sid = h.create_session("doomed")
+    h.add_turn(sid, "user", "hello")
+    h.add_document(sid, name="f.txt", kind="file", ref="f.txt")
+
+    h.delete_session(sid)
+    assert all(s["id"] != sid for s in h.list_sessions())
+    assert h.get_all_turns(sid) == []
+    assert h.get_documents(sid) == []
+
+
+def test_rename_session_and_activity_ordering():
+    h = History(_tmp_db())
+    a, b = h.create_session("first"), h.create_session("second")
+    h.rename_session(a, "renamed")
+    h.add_turn(b, "user", "hi")
+    h.add_turn(a, "user", "hi")  # most recent activity → listed first
+
+    sessions = h.list_sessions()
+    assert sessions[0]["id"] == a and sessions[0]["title"] == "renamed"
+    assert sessions[1]["id"] == b
+
+
 def test_history_survives_restart_via_the_sqlite_file():
     db = _tmp_db()
     sid = History(db).create_session("persisted")

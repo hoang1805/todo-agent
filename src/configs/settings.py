@@ -46,6 +46,11 @@ TRACE = bool(os.getenv("PLANNER_TRACE"))
 # Survives restarts; separate from the LangGraph checkpointer (interrupt/resume).
 HISTORY_DB = os.getenv("HISTORY_DB", str(_SRC_DIR.parent / "chat-history.db"))
 
+# Observability: the shared structured-event + eval-run store (SQLite). Every
+# component logs through core.services.observability into this one file; the
+# dashboard reads it. Its own volume in the container setup.
+EVENTS_DB = os.getenv("EVENTS_DB", str(_SRC_DIR.parent / "events.db"))
+
 # LLM-enhanced guardrails: a screening model reviews user input and verifies that
 # RAG answers are grounded, on top of (never instead of) the deterministic checks
 # in guardrails.py. Any model failure falls back to the deterministic layer, so

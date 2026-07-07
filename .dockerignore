@@ -1,0 +1,14 @@
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.git
+.gitignore
+node_modules
+# Local runtime stores live in named volumes, not the image.
+*.db
+*.db-shm
+*.db-wal
+tests
+docs
+*.md

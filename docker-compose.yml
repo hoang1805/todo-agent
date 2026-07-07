@@ -1,0 +1,72 @@
+# Week-5 deployment: every component as its own container, wired together and to
+# host-native Ollama. Ollama is deliberately NOT containerized (CPU-only / 16GB /
+# two models loaded — a container buys nothing and risks the RAM budget); the
+# services reach it via host.docker.internal, never localhost (localhost inside a
+# container is the container itself). On Linux, `extra_hosts: host-gateway` is what
+# makes that name resolve to the host.
+#
+# Build contexts point at this repo and the sibling todo-agent-mcps repo, so run:
+#   docker compose up --build
+# from the todo-agent/ directory (with ../todo-agent-mcps checked out beside it).
+
+services:
+  task-mcp:
+    build: ../todo-agent-mcps/task-mcp
+    ports:
+      - "8000:8000"
+    volumes:
+      - task_data:/data          # SQLite task DB → survives teardown
+    restart: unless-stopped
+
+  memory-mcp:
+    build: ../todo-agent-mcps/memory-mcp
+    ports:
+      - "8002:8002"
+    environment:
+      # Embeddings run on host Ollama; empty string → offline deterministic embed.
+      OLLAMA_HOST: http://host.docker.internal:11434
+      MEMORY_EMBED_MODEL: ${MEMORY_EMBED_MODEL:-nomic-embed-text-v2-moe:latest}
+    volumes:
+      - memory_data:/data        # ChromaDB vectors → survive teardown
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  orchestrator:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      # Reach the MCP servers by their compose service names (not localhost).
+      TASK_MCP_URL: http://task-mcp:8000/sse
+      MEMORY_MCP_URL: http://memory-mcp:8002/sse
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b-cloud}
+      GUARDRAIL_MODEL: ${GUARDRAIL_MODEL:-ministral-3:14b-cloud}
+      GUARDRAIL_USE_LLM: ${GUARDRAIL_USE_LLM:-1}
+    volumes:
+      - app_data:/data           # chat history + events + checkpoints (shared w/ dashboard)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - task-mcp
+      - memory-mcp
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: ["streamlit", "run", "src/dashboard.py", "--server.port=8502", "--server.address=0.0.0.0"]
+    ports:
+      - "8502:8502"
+    environment:
+      EVENTS_DB: /data/events.db      # read-only view of the same store the app writes
+    volumes:
+      - app_data:/data
+    depends_on:
+      - orchestrator
+    restart: unless-stopped
+
+volumes:
+  task_data:
+  memory_data:
+  app_data:

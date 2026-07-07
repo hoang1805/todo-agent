@@ -51,6 +51,7 @@ class RAGAgent:
         collected: list[DataChunk] = []   # accumulate — never discarded between passes
         current_query, source = query, "both"
         where = {"both": "logs & documents", "logs": "planning logs", "documents": "documents"}
+        reformulations = 0
 
         for i in range(self.MAX_ITERATIONS):
             step(f"🔎 Searching {where.get(source, source)} (pass {i + 1}/{self.MAX_ITERATIONS}) — “{current_query}”")
@@ -66,17 +67,31 @@ class RAGAgent:
                 "[rag] iter=%d query=%r source=%s got=%d sufficient=%s next_query=%r",
                 i, current_query, source, len(chunks), decision.sufficient, decision.next_query,
             )
+            # One event per loop iteration — the persisted trace the agentic-loop
+            # eval inspects to confirm the agent actually reformulated and retried.
+            _log_rag("iteration", details={
+                "pass": i + 1, "source": source, "query": current_query,
+                "got": len(chunks), "gathered": len(collected), "sufficient": decision.sufficient,
+            })
             if decision.sufficient:
                 step("✅ Enough to answer — composing a grounded response")
+                _log_rag("query", details={"iterations": i + 1, "reformulations": reformulations,
+                                           "chunks": len(collected), "outcome": "sufficient"})
                 return self._finish(query, collected)
 
-            current_query = decision.next_query or current_query
+            new_query = decision.next_query or current_query
+            if new_query != current_query:
+                reformulations += 1
+            current_query = new_query
             source = decision.next_source or source
             if i < self.MAX_ITERATIONS - 1:
                 step(f"↻ Not enough — reformulating to “{current_query}”")
 
         # Out of iterations — answer honestly from whatever was collected.
         logger.info("[rag] stopped after %d iterations (%d chunks)", self.MAX_ITERATIONS, len(collected))
+        _log_rag("query", details={"iterations": self.MAX_ITERATIONS, "reformulations": reformulations,
+                                   "chunks": len(collected),
+                                   "outcome": "exhausted" if collected else "empty"})
         if collected:
             step("⏱️ Out of retries — answering from what I found (with a caveat)")
             return self._finish(query, collected)
@@ -90,6 +105,16 @@ class RAGAgent:
         answer = self._generate(query, collected)
         context = "\n".join(text for _, text in _generation_texts(collected))
         return check_output(answer, context)
+
+
+def _log_rag(event_type: str, details: dict) -> None:
+    """Record a RAG-loop event to the shared observability store (best-effort)."""
+    try:
+        from core.services.observability import log_event
+
+        log_event("rag_agent", event_type, details=details)
+    except Exception:  # noqa: BLE001 — logging must never break the loop
+        pass
 
 
 def _rag_debug() -> bool:
@@ -172,7 +197,9 @@ def make_mcp_retriever(tools: list) -> Retriever:
         if tool is None:
             return []
         try:
-            return _coerce_chunks(_run_coro(tool.ainvoke({"query": query, "k": k})))
+            from core.services.observability import timed_tool_call
+
+            return _coerce_chunks(timed_tool_call(tool, {"query": query, "k": k}, _run_coro))
         except Exception as exc:  # noqa: BLE001 — degrade, don't crash the loop
             logger.warning("retrieve via %s failed: %s", getattr(tool, "name", tool), exc)
             return []
@@ -300,7 +327,9 @@ def make_memory_writer(tools: list) -> "Callable[[str, str], None] | None":
 
     def write(text: str, source_type: str) -> None:
         try:
-            _run_coro(remember.ainvoke({"text": text, "source_type": source_type}))
+            from core.services.observability import timed_tool_call
+
+            timed_tool_call(remember, {"text": text, "source_type": source_type}, _run_coro)
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning("remember(%s) failed: %s", source_type, exc)
 
@@ -344,9 +373,11 @@ def make_document_ingestor(tools: list) -> "Callable[[str, dict | None], dict] |
 
     def ingest(text: str, metadata: dict | None = None) -> dict:
         try:
-            raw = _run_coro(remember.ainvoke(
-                {"text": text, "source_type": "document", "metadata": metadata or {}}
-            ))
+            from core.services.observability import timed_tool_call
+
+            raw = timed_tool_call(
+                remember, {"text": text, "source_type": "document", "metadata": metadata or {}}, _run_coro
+            )
             return _coerce_remember_result(raw)
         except Exception as exc:  # noqa: BLE001 — surface a recoverable error
             logger.warning("document ingest failed: %s", exc)

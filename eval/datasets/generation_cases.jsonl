@@ -1,0 +1,5 @@
+# question → rubric a good, grounded answer must satisfy (graded by an LLM judge).
+{"query": "What are the customer support hours?", "rubric": "States support runs 8am to 6pm Pacific on weekdays."}
+{"query": "How long do I have to file an expense report?", "rubric": "Says expense reports must be filed within 30 days."}
+{"query": "How much parental leave is offered?", "rubric": "States 16 weeks of fully paid parental leave."}
+{"query": "What is Acme's flagship product?", "rubric": "Identifies the Zephyr wireless router."}

@@ -56,6 +56,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Annotated, Any, Callable, NotRequired, TYPE_CHECKING, TypedDict
@@ -108,6 +109,7 @@ from agents.todo_agent import ContractError, MutationParser, TodoAgent
 from core.services.checkpoint import make_checkpointer_opener
 from core.services.guardrails import GuardrailError, check_input, check_output, sanity_check_schedule
 from core.services.history import History, get_history
+from core.services.observability import log_event, set_session, track
 from core.services.prompts import load_prompt
 from core.tools.common_tools import make_common_tools
 from models.contract import CrudOp, DayPlan, TaskList, TaskMutation
@@ -144,6 +146,15 @@ def _in_sequence(state) -> bool:
 def _more_steps(state) -> bool:
     """True if the step queue has steps left to dispatch."""
     return state.get("step_index", 0) < len(state.get("steps") or [])
+
+
+# Which agent handles each intent — for the dashboard's per-agent usage breakdown.
+_AGENT_FOR_INTENT = {
+    "plan": "planner_agent", "appointment": "planner_agent", "at_time": "planner_agent",
+    "summary": "todo_agent", "detail": "todo_agent",
+    "add": "todo_agent", "update": "todo_agent", "delete": "todo_agent",
+    "recall": "rag_agent", "complex": "orchestrator", "weather": "orchestrator",
+}
 
 
 def _summarize_delta(delta: dict) -> str:
@@ -204,6 +215,7 @@ class PlannerState(TypedDict):
     """The shared state that flows along the graph's edges."""
 
     user_input: str
+    session_id: NotRequired[str]  # = thread_id; carried so nodes can tag their events
     date: NotRequired[str | None]
     intent: NotRequired[str]
     # The validated task list as a JSON-native dict (so the checkpointer stores
@@ -396,33 +408,41 @@ def build_graph_orchestrator(
         # Echo the user's prompt before any reasoning (for logs/observability).
         logger.info("USER PROMPT: %s", state["user_input"])
         text = state["user_input"]
+        sid = state.get("session_id")
         # Classification is the LLM's job: a single call decides among every intent
         # (incl. `complex` for multi-step requests, `at_time`, `appointment`).
         # `llm_classify_intent` already falls back to the keyword classifier if the
         # model is unreachable or returns an invalid label, so this stays robust.
-        if classifier is not None:
-            return {"intent": classifier(text)}
-        if use_llm:
-            return {"intent": llm_classify_intent(text, model_name).value}
-        # Offline (no model): the deterministic keyword path, with the cheap
-        # detail/time/appointment pre-checks the keyword classifier can't make.
-        if wants_detail(text):
-            return {"intent": "detail"}
-        if asks_about_time(text):
-            return {"intent": "at_time"}
-        appt = appointment_parser(text)  # regex offline
-        if appt is not None:
-            return {"intent": "appointment",
-                    "detected_appointment": {"name": appt.name, "start": appt.start, "end": appt.end}}
-        if len(set(matched_intent_families(text))) > 1:
-            return {"intent": "complex"}
-        return {"intent": classify_intent(text).value}
+        with track("orchestrator", "classify", session_id=sid) as span:
+            if classifier is not None:
+                out = {"intent": classifier(text)}
+            elif use_llm:
+                out = {"intent": llm_classify_intent(text, model_name).value}
+            elif wants_detail(text):
+                out = {"intent": "detail"}
+            elif asks_about_time(text):
+                out = {"intent": "at_time"}
+            elif (appt := appointment_parser(text)) is not None:  # regex offline
+                out = {"intent": "appointment",
+                       "detected_appointment": {"name": appt.name, "start": appt.start, "end": appt.end}}
+            elif len(set(matched_intent_families(text))) > 1:
+                out = {"intent": "complex"}
+            else:
+                out = {"intent": classify_intent(text).value}
+            span["intent"] = out["intent"]
+        # The routing decision: which intent, mapped to the agent that will handle it.
+        log_event("orchestrator", "route", session_id=sid,
+                  details={"intent": out["intent"], "agent": _AGENT_FOR_INTENT.get(out["intent"], "orchestrator")})
+        return out
 
     def run_todo(state: PlannerState) -> dict:
         try:
-            # Store as a JSON-native dict so the checkpointer persists plain types
-            # (not TaskList/Priority, which trip the serde's unregistered-type warning).
-            return {"tasks": todo_agent.run().model_dump(mode="json")}
+            with track("todo_agent", "fetch", session_id=state.get("session_id")) as span:
+                # Store as a JSON-native dict so the checkpointer persists plain types
+                # (not TaskList/Priority, which trip the serde's unregistered-type warning).
+                tasks = todo_agent.run()
+                span["task_count"] = len(tasks.tasks)
+            return {"tasks": tasks.model_dump(mode="json")}
         except ContractError as exc:
             logger.error("Contract failed: %s", exc.errors)
             return {"error": _CONTRACT_ERROR_MSG}
@@ -477,7 +497,19 @@ def build_graph_orchestrator(
 
         # Fold in fixed-time commitments, then plan (LLM + safe fallback).
         wd = workday_with_appointments(wd, appointments)
-        plan = _safe_plan(TaskList.model_validate(state["tasks"]), wd, state.get("date"))
+        sid = state.get("session_id")
+        with track("planner_agent", "plan", session_id=sid) as span:
+            plan = _safe_plan(TaskList.model_validate(state["tasks"]), wd, state.get("date"))
+            span["overloaded"] = plan.overloaded
+            span["blocks"] = len(plan.blocks)
+        # The overload branch: log what got deferred (and why) when the day can't fit.
+        if plan.overloaded:
+            log_event("planner_agent", "overload", session_id=sid, details={
+                "deferred": [t.title for t in plan.deferred],
+                "deferred_count": len(plan.deferred),
+                "scheduled": len(plan.blocks),
+                "available_minutes": plan.available_minutes,
+            })
         out: dict = {
             "result": format_plan(plan),
             "pending_plan": plan.model_dump(mode="json"),
@@ -651,7 +683,8 @@ def build_graph_orchestrator(
         show what the recall agent actually did (which sources, reformulations).
         """
         steps: list[str] = []
-        answer = rag_agent.run(state["user_input"], on_step=steps.append)
+        with track("rag_agent", "invoke", session_id=state.get("session_id")):
+            answer = rag_agent.run(state["user_input"], on_step=steps.append)
         return {"result": answer, "progress": steps}
 
     # -- CRUD path: validate (contract checkpoint) → confirm → execute → replan --
@@ -1075,11 +1108,18 @@ class GraphOrchestrator:
         live progress display); leave it ``None`` for the plain invoke path.
         """
         thread_id = thread_id or str(uuid.uuid4())
+        # Bind this turn's session so every deep call site (guardrails, tools, the
+        # RAG loop) tags its events with it, without threading it through signatures.
+        set_session(thread_id)
+        t0 = time.perf_counter()
         # Guardrail checkpoint #1 — every turn's input passes through here before
         # any routing; a rejection short-circuits without invoking the graph.
         try:
             user_input = check_input(user_input)
         except GuardrailError as exc:
+            log_event("orchestrator", "request", session_id=thread_id, ok=True,
+                      latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+                      details={"blocked": True, "stage": "input_guardrail"})
             return PlannerResult(status="done", thread_id=thread_id, text=exc.message)
         # History: fetch the recent window (prior turns) to inject, then record the
         # user's message. The orchestrator owns this, on every turn.
@@ -1091,6 +1131,7 @@ class GraphOrchestrator:
             self._history.add_turn(thread_id, "user", user_input)
         payload = {
             "user_input": user_input,
+            "session_id": thread_id,
             "history": history_window,
             "date": date,
             # `messages` is append-only — the conversation memory we keep.
@@ -1117,7 +1158,16 @@ class GraphOrchestrator:
             "plan_feedback": "",
             "pending_plan": None,
         }
-        result = self._interpret(self._drive(payload, thread_id, on_step), thread_id)
+        try:
+            result = self._interpret(self._drive(payload, thread_id, on_step), thread_id)
+        except Exception:
+            log_event("orchestrator", "request", session_id=thread_id, ok=False,
+                      latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+                      details={"stage": "run"})
+            raise
+        log_event("orchestrator", "request", session_id=thread_id, ok=True,
+                  latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+                  details={"status": result.status})
         self._record_assistant(thread_id, result)
         return result
 
@@ -1133,6 +1183,7 @@ class GraphOrchestrator:
         "reason": "..."}``, or ``{"action": "edit", "args": {...}}``. Pass
         *on_step* to stream the post-approval steps (execute → re-plan, …).
         """
+        set_session(thread_id)
         result = self._interpret(self._drive(Command(resume=decision), thread_id, on_step), thread_id)
         self._record_assistant(thread_id, result)
         return result

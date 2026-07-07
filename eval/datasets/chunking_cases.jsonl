@@ -1,0 +1,8 @@
+# Identical retrieval cases run against two chunking strategies of the same doc.
+{"query": "how many devices does the Zephyr router support", "expect": "40 simultaneous devices"}
+{"query": "when is the customer support hotline open", "expect": "8am to 6pm Pacific"}
+{"query": "deadline to file an expense report", "expect": "within 30 days"}
+{"query": "meal reimbursement limit while travelling", "expect": "60 US dollars"}
+{"query": "when does the annual security audit happen", "expect": "every October"}
+{"query": "how often must passwords be rotated", "expect": "every 90 days"}
+{"query": "how much parental leave do employees get", "expect": "16 weeks"}

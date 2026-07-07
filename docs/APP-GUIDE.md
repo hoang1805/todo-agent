@@ -214,3 +214,58 @@ MEMORY_DEBUG=1 uv run python src/main.py        # in todo-agent-mcps/memory-mcp
 # terminal 2 — the app, tracing nodes + full RAG chunk text
 PLANNER_TRACE=1 RAG_DEBUG=1 streamlit run src/app.py
 ```
+
+---
+
+## 7. Observability — one logging interface, one store
+
+Every reliability checkpoint records a structured **event** through one function,
+[`log_event()`](../src/core/services/observability.py) (or the `track()` context
+manager that also times a block and marks success). Same idea as `guardrails.py`:
+one shared module, many call sites, instead of ad-hoc logging everywhere.
+
+- **Store:** SQLite `events.db` (`EVENTS_DB`). `events(ts, component, event_type,
+  session_id, ok, latency_ms, details)` — consistent columns to group/filter on, a
+  JSON `details` blob for per-event fields. A second table `eval_runs` holds
+  evaluation scores. Chosen for the same reasons as chat history: local, durable
+  across restarts *and* container teardown, and *queryable*.
+- **Session:** the orchestrator binds the turn's `session_id` in a contextvar
+  (`set_session`), so deep sites (guardrails, tool wrappers, the RAG loop) tag their
+  events without threading it through every signature.
+- **Call sites:** orchestrator request/route/classify, each agent node, both
+  guardrail checks, all five MCP tool calls (`timed_tool_call`), the RAG loop
+  (per-iteration + a query summary with the iteration count), and the planner's
+  **overload** branch (records what was deferred).
+- **Dashboard:** `streamlit run src/dashboard.py` — a *read-only* view. Every number
+  comes from an `Observer` query method (aggregation in SQL); the dashboard renders,
+  it never computes. Panels: requests over time, per-agent usage, guardrail block
+  rate, avg RAG iterations, error rate, latency, eval-score trend, event feed.
+
+## 8. Evaluation — a manual regression check
+
+`eval/` is a test-suite-style harness, never on the request path. Five types, each
+a JSONL dataset + a runner; `run_all.py` runs them and `report.py` scores/persists:
+
+- **retrieval** — hit-rate of `retrieve_document` on known facts (no LLM). The
+  instrument for measuring an embedding-model swap.
+- **chunking** — the same doc ingested under two strategies into separately *tagged*
+  data (memory-mcp's `remember(strategy=…)` + `retrieve_document(tag=…)`), hit-rates
+  compared side by side — a measured before/after.
+- **loop** — RAGAgent *control flow*: reads the persisted trace to confirm it
+  reformulated after a weak pass and that `MAX_ITERATIONS` terminates.
+- **generation** — end-to-end, graded by an **LLM-as-judge** (question + rubric +
+  the real answer → pass/fail). Catches prompt regressions.
+- **guardrail** — adversarial (should block) *and* legitimate (should allow) inputs;
+  both required, or you can't tell a strict guardrail from a broken one.
+
+Each run persists to `eval_runs`, so the dashboard charts quality over time.
+
+## 9. Deployment — four containers, host Ollama
+
+`docker compose up --build` starts each component as its own service:
+`task-mcp`, `memory-mcp`, `orchestrator` (the chat app), and `dashboard` (the two
+app services share one image, different entrypoints). **Ollama stays on the host** —
+containers reach it at `http://host.docker.internal:11434` (with
+`extra_hosts: host.docker.internal:host-gateway` on Linux), never `localhost`.
+Named volumes (`task_data`, `memory_data`, `app_data`) hold the SQLite/Chroma
+stores, so a full `down`/`up` teardown keeps every conversation, memory, and event.

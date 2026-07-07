@@ -158,20 +158,41 @@ def llm_is_grounded(answer: str, context: str) -> bool | None:
 # ---------------------------------------------------------------------------
 
 
+def _log_guardrail(event_type: str, ok: bool, details: dict) -> None:
+    """Record a guardrail check into the shared observability store (best-effort)."""
+    try:
+        from core.services.observability import log_event
+
+        log_event("guardrail", event_type, ok=ok, details=details)
+    except Exception:  # noqa: BLE001 — logging must never affect the check
+        pass
+
+
 def check_input(text: str) -> str:
     """Validate a user message before routing; raise :class:`GuardrailError` to reject.
 
     Deterministic checks first (cheap, always on); then the LLM screen, which can
-    catch paraphrased injection/abuse the phrase list misses.
+    catch paraphrased injection/abuse the phrase list misses. Every outcome — pass
+    or block, with the reason — is logged to the observability store.
     """
-    if not (text or "").strip():
-        raise GuardrailError("Please type a message.")
-    if len(text) > MAX_INPUT_CHARS:
-        raise GuardrailError(
-            f"That message is too long ({len(text)} chars; limit {MAX_INPUT_CHARS}). "
-            "Please shorten it."
-        )
-    llm_check_input(text)
+    try:
+        if not (text or "").strip():
+            raise GuardrailError("Please type a message.")
+        if len(text) > MAX_INPUT_CHARS:
+            raise GuardrailError(
+                f"That message is too long ({len(text)} chars; limit {MAX_INPUT_CHARS}). "
+                "Please shorten it."
+            )
+        # Deterministic injection screen (defense in depth): blatant override
+        # phrases are blocked even when the LLM screen is off/unreachable. The LLM
+        # layer below then adds coverage for paraphrased attempts the list misses.
+        if contains_injection(text):
+            raise GuardrailError("That message looks like an attempt to override the assistant's instructions.")
+        llm_check_input(text)
+    except GuardrailError as exc:
+        _log_guardrail("input", ok=False, details={"reason": exc.message, "chars": len(text or "")})
+        raise
+    _log_guardrail("input", ok=True, details={"chars": len(text)})
     return text.strip()
 
 
@@ -246,12 +267,19 @@ def check_output(text: str, context: str | None = None) -> str:
     token-overlap heuristic is the fallback when the model has no opinion.
     """
     out = (text or "").strip()
+    caveated = False
     if context is not None and out:
         grounded = llm_is_grounded(out, context)
+        used_llm = grounded is not None
         if grounded is None:
             grounded = is_grounded(out, context)
         if not grounded:
             out += "\n\n_(Note: this answer may not be fully grounded in your stored data.)_"
+            caveated = True
+        _log_guardrail("output", ok=True, details={
+            "grounded": bool(grounded), "caveat_added": caveated,
+            "judge": "llm" if used_llm else "overlap",
+        })
     return out
 
 

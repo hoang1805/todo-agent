@@ -379,7 +379,9 @@ def make_mcp_fetcher(tools: list[BaseTool]) -> RawFetcher:
             logger.warning("No task MCP tool found; using sample tasks.")
             return sample_raw_tasks()
         try:
-            return _coerce_raw(_run_coro(tool.ainvoke({})))
+            from core.services.observability import timed_tool_call
+
+            return _coerce_raw(timed_tool_call(tool, {}, _run_coro))
         except Exception as exc:  # noqa: BLE001 — degrade to a working demo
             logger.warning("MCP task fetch failed (%s); using sample tasks.", exc)
             return sample_raw_tasks()
@@ -608,7 +610,9 @@ def make_mutation_executor(tools: list[BaseTool]) -> MutationExecutor:
             raise LookupError(
                 f"the task server does not expose '{MUTATION_TOOL_NAMES[kind]}'"
             )
-        result = _run_coro(tool.ainvoke(args))
+        from core.services.observability import timed_tool_call
+
+        result = timed_tool_call(tool, args, _run_coro)
         # The MCP server returns a structured recoverable error on failure; treat
         # ``{"ok": false, "error": ...}`` (dict or JSON string) as a failed call.
         payload = result

@@ -34,7 +34,7 @@ class RAGAgent:
 
     MAX_ITERATIONS = 3
 
-    def __init__(self, retrieve: Retriever, judge: Judge, generate: Generator, k: int = 3):
+    def __init__(self, retrieve: Retriever, judge: Judge, generate: Generator, k: int = 6):
         self._retrieve = retrieve
         self._judge = judge
         self._generate = generate

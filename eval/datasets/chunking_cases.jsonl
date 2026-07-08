@@ -6,3 +6,7 @@
 {"query": "when does the annual security audit happen", "expect": "every October"}
 {"query": "how often must passwords be rotated", "expect": "every 90 days"}
 {"query": "how much parental leave do employees get", "expect": "16 weeks"}
+{"query": "how much memory does a new engineer's laptop have", "expect": "32 gigabytes"}
+{"query": "nightly hotel spending cap when travelling", "expect": "200 US dollars per night"}
+{"query": "when is the Portland headquarters open", "expect": "7am until 9pm"}
+{"query": "how fast is broken equipment replaced", "expect": "two business days"}

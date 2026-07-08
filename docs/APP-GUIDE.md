@@ -236,10 +236,13 @@ one shared module, many call sites, instead of ad-hoc logging everywhere.
   guardrail checks, all five MCP tool calls (`timed_tool_call`), the RAG loop
   (per-iteration + a query summary with the iteration count), and the planner's
   **overload** branch (records what was deferred).
-- **Dashboard:** `streamlit run src/dashboard.py` — a *read-only* view. Every number
-  comes from an `Observer` query method (aggregation in SQL); the dashboard renders,
-  it never computes. Panels: requests over time, per-agent usage, guardrail block
-  rate, avg RAG iterations, error rate, latency, eval-score trend, event feed.
+- **Dashboard:** the `render_dashboard()` view, shown **inside the app** via the
+  sidebar **View** toggle (`💬 Chat` / `📊 Dashboard`) — same port, not a separate
+  service. A *read-only* view: every number comes from an `Observer` query method
+  (aggregation in SQL); the dashboard renders, it never computes. Panels: requests
+  over time, per-agent usage, guardrail block rate, avg RAG iterations, error rate,
+  latency, MCP-server registry, agent detail, session inspector, eval-score trend +
+  per-case results, agent debug trace, event feed.
 
 ## 8. Evaluation — a manual regression check
 

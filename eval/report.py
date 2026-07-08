@@ -54,16 +54,34 @@ Every employee must rotate their account password at least once every 90 days.
 ## Benefits
 Parental leave is 16 weeks fully paid for all full-time employees.
 The company matches retirement contributions up to 6 percent of salary.
+
+## Travel
+Flights longer than five hours may be booked in premium economy for eligible staff.
+Hotel stays are capped at 200 US dollars per night in standard cities.
+
+## Equipment
+New engineers receive a laptop with 32 gigabytes of memory on their first day.
+Broken equipment is replaced within two business days by the IT helpdesk.
+
+## Office
+The Portland headquarters is open to employees from 7am until 9pm on weekdays.
+Guest visitors must be registered at the front desk at least one day in advance.
 """
 
 
 @dataclass
 class Result:
-    """One case's outcome."""
+    """One case's outcome.
+
+    ``criteria`` is an optional per-criterion breakdown for LLM-judged evals — each
+    entry ``{"criterion": str, "met": bool}`` — so the report can *list every
+    criterion the answer was scored against*, not just an overall pass/fail.
+    """
 
     name: str
     passed: bool
     info: str = ""
+    criteria: list[dict] | None = None
 
 
 @dataclass
@@ -136,6 +154,9 @@ def summarize(eval_type: str, results: list[Result], note: str = "", *, persist:
     for r in results:
         mark = "✅" if r.passed else "❌"
         print(f"  {mark} {r.name}" + (f"  — {r.info}" if r.info else ""))
+        # List every criterion the answer was scored against (LLM-judge evals).
+        for cr in (r.criteria or []):
+            print(f"       {'✓' if cr.get('met') else '✗'} {cr.get('criterion', '')}")
     print(f"  score: {passed}/{len(results)} = {summary.score * 100:.1f}%" + (f"   ({note})" if note else ""))
 
     if persist:
@@ -143,7 +164,10 @@ def summarize(eval_type: str, results: list[Result], note: str = "", *, persist:
             from core.services.observability import record_eval_run
 
             record_eval_run(eval_type, summary.score, passed, len(results), note,
-                            details={"cases": [{"name": r.name, "passed": r.passed} for r in results]})
+                            details={"cases": [
+                                {"name": r.name, "passed": r.passed, "criteria": r.criteria}
+                                for r in results
+                            ]})
         except Exception as exc:  # noqa: BLE001 — a store hiccup shouldn't fail the eval
             print(f"  (warning: could not persist eval run: {exc})")
 

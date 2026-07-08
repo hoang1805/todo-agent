@@ -73,6 +73,12 @@ class RAGAgent:
                 "pass": i + 1, "source": source, "query": current_query,
                 "got": len(chunks), "gathered": len(collected), "sufficient": decision.sufficient,
             })
+            # Debug trace: the judge's verdict and where it would look next.
+            _debug_rag(
+                f"pass {i + 1}: judged sufficient={decision.sufficient}",
+                query=current_query, source=source, got=len(chunks),
+                next_query=decision.next_query, next_source=decision.next_source,
+            )
             if decision.sufficient:
                 step("✅ Enough to answer — composing a grounded response")
                 _log_rag("query", details={"iterations": i + 1, "reformulations": reformulations,
@@ -114,6 +120,16 @@ def _log_rag(event_type: str, details: dict) -> None:
 
         log_event("rag_agent", event_type, details=details)
     except Exception:  # noqa: BLE001 — logging must never break the loop
+        pass
+
+
+def _debug_rag(message: str, **details) -> None:
+    """Fine-grained RAG debug trace (only persisted when AGENT_DEBUG is on)."""
+    try:
+        from core.services.observability import log_debug
+
+        log_debug("rag_agent", message, **details)
+    except Exception:  # noqa: BLE001 — debug logging must never break the loop
         pass
 
 

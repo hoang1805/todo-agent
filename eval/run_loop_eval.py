@@ -31,6 +31,8 @@ def _scripted_retriever(kind: str):
             return []
         if kind == "strong":
             return [strong]
+        if kind == "stuck":
+            return [weak]                                # never improves → reformulate to the cap
         return [weak] if state["n"] == 1 else [strong]   # weak → strong
 
     return retrieve

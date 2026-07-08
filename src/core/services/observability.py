@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -193,6 +194,27 @@ class Observer:
         with self._conn() as c:
             return [dict(r) for r in c.execute(q, args).fetchall()]
 
+    def latest_eval_run(self, eval_type: str) -> dict | None:
+        """The most recent run of one eval type, **with its per-case details**.
+
+        Unlike :meth:`latest_eval_scores` (a scoreboard row), this parses the stored
+        ``details`` blob so the dashboard can list each case's pass/fail and — for the
+        generation eval — the per-criterion ✓/✗ breakdown the LLM judge produced.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT ts, eval_type, score, passed, total, note, details FROM eval_runs "
+                "WHERE eval_type=? ORDER BY id DESC LIMIT 1", (eval_type,),
+            ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        try:
+            d["details"] = json.loads(d.get("details") or "{}")
+        except (ValueError, TypeError):
+            d["details"] = {}
+        return d
+
     def latest_eval_scores(self) -> list[dict]:
         """The most recent run of each eval type (for a scoreboard row)."""
         with self._conn() as c:
@@ -202,6 +224,131 @@ class Observer:
                 "ON e.id = m.mid ORDER BY e.eval_type"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # -- per-agent / per-session detail (the "all about the agents" view) -----
+
+    def intent_breakdown(self) -> list[dict]:
+        """How the orchestrator classified traffic: each intent → its agent + count.
+
+        Reads the ``orchestrator/route`` events (the routing decision), so the panel
+        shows *what the agents were actually asked to do*, not just how often they ran.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT json_extract(details,'$.intent') intent, "
+                "json_extract(details,'$.agent') agent, COUNT(*) n FROM events "
+                "WHERE component='orchestrator' AND event_type='route' "
+                "GROUP BY intent, agent ORDER BY n DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def tool_usage(self) -> list[dict]:
+        """Per MCP tool: call count, average latency, and failure count.
+
+        Every tool call is logged under ``component='tool'`` with the tool name as
+        the event type (via :func:`timed_tool_call`), so this is the tool mix.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT event_type tool, COUNT(*) n, AVG(latency_ms) avg_ms, "
+                "SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) failures FROM events "
+                "WHERE component='tool' GROUP BY event_type ORDER BY n DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def latency_by_operation(self) -> list[dict]:
+        """Average/max latency per operation (component + event type) — finer than
+        :meth:`avg_latency_by_component`. Surfaces e.g. how slow classification (an
+        LLM call) is versus a plan versus each tool."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT component || '/' || event_type op, AVG(latency_ms) avg_ms, "
+                "MAX(latency_ms) max_ms, COUNT(latency_ms) n FROM events "
+                "WHERE latency_ms IS NOT NULL GROUP BY component, event_type ORDER BY avg_ms DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def planner_summary(self) -> dict:
+        """DailyPlanner rollup: plans generated, how many overloaded (+ rate), and how
+        many tasks got deferred in total. The overload branch is a first-class event."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT "
+                "SUM(CASE WHEN event_type='plan' THEN 1 ELSE 0 END) plans, "
+                "SUM(CASE WHEN event_type='overload' THEN 1 ELSE 0 END) overloads, "
+                "SUM(CASE WHEN event_type='overload' "
+                "    THEN json_extract(details,'$.deferred_count') ELSE 0 END) deferred, "
+                "AVG(CASE WHEN event_type='overload' "
+                "    THEN json_extract(details,'$.available_minutes') END) avg_available "
+                "FROM events WHERE component='planner_agent'"
+            ).fetchone()
+        plans, overloads = (row["plans"] or 0), (row["overloads"] or 0)
+        return {
+            "plans": plans, "overloads": overloads,
+            "rate": (overloads / plans) if plans else 0.0,
+            "deferred": row["deferred"] or 0,
+            "avg_available": row["avg_available"],
+        }
+
+    def recent_overloads(self, limit: int = 10) -> list[dict]:
+        """The most recent overload events (with their deferred task titles)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT ts, session_id, details FROM events "
+                "WHERE component='planner_agent' AND event_type='overload' "
+                "ORDER BY id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [self._row(r) for r in rows]
+
+    def session_summary(self, limit: int = 50) -> list[dict]:
+        """One row per conversation: event count, request count, first/last timestamps.
+
+        Feeds the session inspector — pick a session, see everything it did."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT session_id, COUNT(*) events, "
+                "SUM(CASE WHEN component='orchestrator' AND event_type='request' THEN 1 ELSE 0 END) requests, "
+                "SUM(CASE WHEN component='guardrail' AND ok=0 THEN 1 ELSE 0 END) blocks, "
+                "MIN(ts) first_ts, MAX(ts) last_ts FROM events "
+                "WHERE session_id IS NOT NULL GROUP BY session_id ORDER BY last_ts DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def events_for_session(self, session_id: str, limit: int = 500) -> list[dict]:
+        """The full ordered event timeline for one session (the drill-down)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT ts, component, event_type, ok, latency_ms, details FROM events "
+                "WHERE session_id=? ORDER BY id LIMIT ?", (session_id, limit),
+            ).fetchall()
+        return [self._row(r) for r in rows]
+
+    def mcp_servers(self) -> list[dict]:
+        """The latest registry event per MCP server (name, url, status, tools).
+
+        Each server logs one ``mcp_server`` event when the app loads its tools (event
+        type = the server name); we take the most recent per server so the panel
+        reflects the current registry. The dashboard renders these — it never
+        connects to the servers itself.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT e.event_type server, e.ok, e.ts, e.details FROM events e "
+                "JOIN (SELECT event_type, MAX(id) mid FROM events "
+                "      WHERE component='mcp_server' GROUP BY event_type) m "
+                "ON e.id = m.mid ORDER BY e.event_type"
+            ).fetchall()
+        return [self._row(r) for r in rows]
+
+    def debug_events(self, limit: int = 100) -> list[dict]:
+        """Recent agent debug-trace events (only emitted when AGENT_DEBUG is on)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT ts, component, event_type, session_id, ok, latency_ms, details "
+                "FROM events WHERE event_type='debug' ORDER BY id DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [self._row(r) for r in rows]
 
     @staticmethod
     def _row(r: sqlite3.Row) -> dict:
@@ -253,6 +400,31 @@ def log_event(
         )
     except Exception as exc:  # noqa: BLE001 — observability must not break the app
         logger.debug("log_event dropped (%s)", exc)
+
+
+def debug_enabled() -> bool:
+    """Whether agent debug tracing is on (``AGENT_DEBUG=1``).
+
+    Read live from the environment so it can be toggled per run (CLI, tests) without
+    a restart — the same "tag debug" switch, but persisted to the store instead of
+    printed and lost.
+    """
+    return (os.getenv("AGENT_DEBUG") or "").lower() in ("1", "true", "yes")
+
+
+def log_debug(component: str, message: str, *, session_id: str | None = None, **details) -> None:
+    """Record a fine-grained agent debug event — but only when :func:`debug_enabled`.
+
+    This is the shared "tag debug" trace: agents call it at decision points (the
+    classifier's raw output, each RAG reformulation + judge verdict, the planner's
+    chosen workday) and, when the flag is on, the detail lands in the events store
+    where the dashboard's Debug trace panel shows it. A no-op when the flag is off,
+    so leaving the calls in place costs nothing in normal operation.
+    """
+    if not debug_enabled():
+        return
+    log_event(component, "debug", session_id=session_id, ok=True,
+              details={"message": message, **details})
 
 
 @contextmanager

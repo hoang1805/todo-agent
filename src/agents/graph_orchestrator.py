@@ -109,7 +109,7 @@ from agents.todo_agent import ContractError, MutationParser, TodoAgent
 from core.services.checkpoint import make_checkpointer_opener
 from core.services.guardrails import GuardrailError, check_input, check_output, sanity_check_schedule
 from core.services.history import History, get_history
-from core.services.observability import log_event, set_session, track
+from core.services.observability import log_debug, log_event, set_session, track
 from core.services.prompts import load_prompt
 from core.tools.common_tools import make_common_tools
 from models.contract import CrudOp, DayPlan, TaskList, TaskMutation
@@ -433,6 +433,7 @@ def build_graph_orchestrator(
         # The routing decision: which intent, mapped to the agent that will handle it.
         log_event("orchestrator", "route", session_id=sid,
                   details={"intent": out["intent"], "agent": _AGENT_FOR_INTENT.get(out["intent"], "orchestrator")})
+        log_debug("orchestrator", f"classified → {out['intent']}", session_id=sid, text=text[:80])
         return out
 
     def run_todo(state: PlannerState) -> dict:
@@ -498,6 +499,8 @@ def build_graph_orchestrator(
         # Fold in fixed-time commitments, then plan (LLM + safe fallback).
         wd = workday_with_appointments(wd, appointments)
         sid = state.get("session_id")
+        log_debug("planner_agent", f"workday {wd.start}–{wd.end}", session_id=sid,
+                  appointments=[a["name"] for a in appointments])
         with track("planner_agent", "plan", session_id=sid) as span:
             plan = _safe_plan(TaskList.model_validate(state["tasks"]), wd, state.get("date"))
             span["overloaded"] = plan.overloaded

@@ -58,6 +58,20 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
 
+    # -- Top-level view switch: chat and the observability dashboard live in the
+    #    SAME app (one port), toggled here — not a separate service. ----------
+    page = st.sidebar.radio(
+        "View", ["💬 Chat", "📊 Dashboard"],
+        horizontal=True, label_visibility="collapsed",
+    )
+    st.sidebar.markdown("---")
+
+    if page == "📊 Dashboard":
+        from dashboard import render_dashboard
+
+        render_dashboard()
+        return
+
     # -- Skills (loaded once; cheap — just file reads) ----------------------
     skills, skill_errors = load_skills(cfg.SKILL_SOURCES)
     for error in skill_errors:

@@ -7,3 +7,11 @@
 {"query": "how often must passwords be rotated", "expect": "every 90 days"}
 {"query": "how much parental leave do employees get", "expect": "16 weeks"}
 {"query": "retirement contribution matching", "expect": "6 percent of salary"}
+{"query": "premium customer response SLA", "expect": "four-hour response SLA"}
+{"query": "how much memory does a new engineer's laptop have", "expect": "32 gigabytes"}
+{"query": "how fast is broken equipment replaced", "expect": "two business days"}
+{"query": "nightly hotel spending cap when travelling", "expect": "200 US dollars per night"}
+{"query": "which flights can be booked in premium economy", "expect": "longer than five hours"}
+{"query": "when is the Portland headquarters open", "expect": "7am until 9pm"}
+{"query": "how far in advance must guests be registered", "expect": "one day in advance"}
+{"query": "how many units can the Zephyr mesh", "expect": "mesh of three units"}

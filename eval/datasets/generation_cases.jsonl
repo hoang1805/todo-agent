@@ -1,5 +1,10 @@
-# question → rubric a good, grounded answer must satisfy (graded by an LLM judge).
-{"query": "What are the customer support hours?", "rubric": "States support runs 8am to 6pm Pacific on weekdays."}
-{"query": "How long do I have to file an expense report?", "rubric": "Says expense reports must be filed within 30 days."}
-{"query": "How much parental leave is offered?", "rubric": "States 16 weeks of fully paid parental leave."}
+# question → criteria a good, grounded answer must satisfy (each graded by an LLM judge).
+# A case passes only if EVERY criterion is met. A single legacy "rubric" string still works.
+{"query": "What are the customer support hours?", "criteria": ["States support runs from 8am to 6pm Pacific time", "Notes it is on weekdays"]}
+{"query": "How long do I have to file an expense report?", "criteria": ["Says expense reports must be filed within 30 days", "Does not invent a different deadline"]}
+{"query": "How much parental leave is offered, and is it paid?", "criteria": ["States 16 weeks of parental leave", "Says it is fully paid"]}
+{"query": "What laptop do new engineers receive?", "criteria": ["Mentions the laptop has 32 gigabytes of memory", "States it is given on the first day"]}
+{"query": "What is the hotel budget when travelling?", "criteria": ["States hotels are capped at 200 US dollars per night", "Notes the cap is for standard cities"]}
+{"query": "Can I expense alcohol on a work trip?", "criteria": ["Says meals are reimbursed up to 60 US dollars per day", "States that alcohol is not reimbursed"]}
+{"query": "How often must I change my password?", "criteria": ["States passwords must be rotated at least every 90 days"]}
 {"query": "What is Acme's flagship product?", "rubric": "Identifies the Zephyr wireless router."}

@@ -5,13 +5,13 @@
 # container is the container itself). On Linux, `extra_hosts: host-gateway` is what
 # makes that name resolve to the host.
 #
-# Build contexts point at this repo and the sibling todo-agent-mcps repo, so run:
+# Build contexts point at this repo and the sibling MCP repo (../mcps), so run:
 #   docker compose up --build
-# from the todo-agent/ directory (with ../todo-agent-mcps checked out beside it).
+# from the todo-agent/ directory (with ../mcps checked out beside it).
 
 services:
   task-mcp:
-    build: ../todo-agent-mcps/task-mcp
+    build: ../mcps/task-mcp
     ports:
       - "8000:8000"
     volumes:
@@ -19,7 +19,7 @@ services:
     restart: unless-stopped
 
   memory-mcp:
-    build: ../todo-agent-mcps/memory-mcp
+    build: ../mcps/memory-mcp
     ports:
       - "8002:8002"
     environment:
@@ -45,25 +45,12 @@ services:
       GUARDRAIL_MODEL: ${GUARDRAIL_MODEL:-ministral-3:14b-cloud}
       GUARDRAIL_USE_LLM: ${GUARDRAIL_USE_LLM:-1}
     volumes:
-      - app_data:/data           # chat history + events + checkpoints (shared w/ dashboard)
+      - app_data:/data           # chat history + events + checkpoints (dashboard is a tab in this app)
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       - task-mcp
       - memory-mcp
-    restart: unless-stopped
-
-  dashboard:
-    build: .
-    command: ["streamlit", "run", "src/dashboard.py", "--server.port=8502", "--server.address=0.0.0.0"]
-    ports:
-      - "8502:8502"
-    environment:
-      EVENTS_DB: /data/events.db      # read-only view of the same store the app writes
-    volumes:
-      - app_data:/data
-    depends_on:
-      - orchestrator
     restart: unless-stopped
 
 volumes:

@@ -51,7 +51,38 @@ async def get_mcp_tools(servers: dict[str, str]) -> list[BaseTool]:
     for name, url in servers.items():
         try:
             client = build_mcp_client({name: url})
-            tools += await client.get_tools()
+            server_tools = await client.get_tools()
+            tools += server_tools
+            _log_server_registry(name, url, server_tools, ok=True)
         except Exception as exc:  # noqa: BLE001 — skip an unreachable server
             logger.warning("MCP server %r unavailable (%s); skipping its tools.", name, exc)
+            _log_server_registry(name, url, [], ok=False, error=str(exc))
     return tools
+
+
+def _log_server_registry(
+    name: str, url: str, server_tools: list[BaseTool], *, ok: bool, error: str = "",
+) -> None:
+    """Record which tools a server exposed, so the dashboard can show its registry.
+
+    One event per server (``component='mcp_server'``, event type = the server name),
+    carrying the tool count and each tool's name + description. The dashboard reads
+    the *latest* such event per server — it never connects to the servers itself
+    (it's a separate, read-only process). Best-effort: never breaks tool loading.
+    """
+    try:
+        from core.services.observability import log_event
+
+        details = {
+            "url": url,
+            "tool_count": len(server_tools),
+            "tools": [
+                {"name": t.name, "description": (getattr(t, "description", "") or "").strip()[:300]}
+                for t in server_tools
+            ],
+        }
+        if error:
+            details["error"] = error[:200]
+        log_event("mcp_server", name, ok=ok, details=details)
+    except Exception:  # noqa: BLE001 — registry logging must never break the load
+        pass

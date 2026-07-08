@@ -1,6 +1,6 @@
-# The app image — runs BOTH the chat orchestrator (app.py) and the observability
-# dashboard (dashboard.py). Same code + deps; compose picks the entrypoint per
-# service, so "one service per component" holds without a second image to build.
+# The app image — the chat orchestrator (app.py). The observability dashboard is
+# a view *inside* this same app (a "📊 Dashboard" tab), so it's one service on one
+# port, not a separate container/port.
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -17,6 +17,6 @@ ENV PYTHONPATH=/app/src \
     EVENTS_DB=/data/events.db \
     CHECKPOINT_DB=/data/agent-checkpoints.db
 
-# Default command is the chat app; the dashboard service overrides it in compose.
+# One app, one port — chat + dashboard both served here.
 EXPOSE 8501
 CMD ["streamlit", "run", "src/app.py", "--server.port=8501", "--server.address=0.0.0.0"]

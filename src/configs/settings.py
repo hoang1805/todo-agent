@@ -62,3 +62,9 @@ GUARDRAIL_USE_LLM = os.getenv("GUARDRAIL_USE_LLM", "1").lower() in ("1", "true",
 # into the RAG step trace — visible in the UI steps box and, with PLANNER_TRACE,
 # the terminal. Off by default: it makes traces long.
 RAG_DEBUG = bool(os.getenv("RAG_DEBUG"))
+
+# Debug: when set (``AGENT_DEBUG=1``), agents persist fine-grained "debug" events
+# (the classifier's raw decision, each RAG reformulation + judge verdict, the
+# planner's chosen workday) into the events store, surfaced in the dashboard's
+# Debug trace panel. Off by default; read live so it can be toggled per run.
+AGENT_DEBUG = bool(os.getenv("AGENT_DEBUG"))

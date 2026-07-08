@@ -2,3 +2,4 @@
 {"name": "weak_then_strong", "first": "weak", "expect_reformulate": true, "expect_outcome": "sufficient"}
 {"name": "never_satisfiable", "first": "empty", "expect_reformulate": true, "expect_outcome": "empty"}
 {"name": "strong_first", "first": "strong", "expect_reformulate": false, "expect_outcome": "sufficient"}
+{"name": "persistently_weak", "first": "stuck", "expect_reformulate": true, "expect_outcome": "exhausted"}

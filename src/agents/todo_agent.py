@@ -103,6 +103,31 @@ def _infer_category(title: str) -> str:
     return "general"
 
 
+# External task sources may use priority words outside our low/medium/high
+# vocabulary (task-mcp, for one, allows "critical"). Map them onto the contract
+# rather than rejecting the whole batch — coercing messy input is the normalizer's
+# job; the Task model still validates the result.
+_PRIORITY_ALIASES = {
+    "critical": Priority.high, "urgent": Priority.high, "highest": Priority.high,
+    "high": Priority.high, "p0": Priority.high, "p1": Priority.high,
+    "medium": Priority.medium, "med": Priority.medium, "normal": Priority.medium,
+    "moderate": Priority.medium, "p2": Priority.medium,
+    "low": Priority.low, "minor": Priority.low, "lowest": Priority.low,
+    "p3": Priority.low, "p4": Priority.low,
+}
+
+
+def _coerce_priority(value: object) -> Priority:
+    """Map an arbitrary priority string onto the low/medium/high contract."""
+    key = str(value if value is not None else "medium").strip().lower()
+    if key in _PRIORITY_ALIASES:
+        return _PRIORITY_ALIASES[key]
+    try:
+        return Priority(key)
+    except ValueError:
+        return Priority.medium  # unknown → a safe default, never a crash
+
+
 def heuristic_normalize(raw: list[dict]) -> TaskList:
     """Normalize raw records into a validated TaskList without an LLM.
 
@@ -112,7 +137,7 @@ def heuristic_normalize(raw: list[dict]) -> TaskList:
     """
     tasks: list[Task] = []
     for index, record in enumerate(raw):
-        priority = Priority(str(record.get("priority", "medium")).lower())
+        priority = _coerce_priority(record.get("priority"))
         est = int(record.get("est_minutes") or _DEFAULT_EST[priority])
         title = str(record.get("title") or record.get("name") or "").strip()
         category = record.get("category") or _infer_category(title)

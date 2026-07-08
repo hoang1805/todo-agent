@@ -101,6 +101,30 @@ def test_agent_tools_loop_executes_a_tool_then_finishes(monkeypatch):
     assert fake.calls == 2  # agent → (tools) → agent: looped exactly once
 
 
+class _UnreachableLLM:
+    """A fake chat model whose calls fail — stands in for Ollama being down."""
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, _messages):
+        raise ConnectionError("[Errno 111] Connection refused")
+
+
+def test_agent_degrades_gracefully_when_the_llm_is_unreachable(monkeypatch):
+    # An 'unknown'-intent turn routes to the chat agent; if the LLM is unreachable
+    # the turn must return a friendly message, not surface a raw traceback.
+    monkeypatch.setattr(llm_client, "create_ollama_model", lambda *a, **k: _UnreachableLLM())
+
+    go = build_graph_orchestrator(
+        tools=[], model_name="dummy", use_llm=True, classifier=lambda text: "unknown",
+    )
+    out = go.run("tell me a joke about routers")  # not plan/summary → agent path
+
+    assert "isn't reachable" in out          # the graceful degrade message
+    assert "plan my day" in out              # points at the working offline features
+
+
 # -- human-in-the-loop -------------------------------------------------------
 
 

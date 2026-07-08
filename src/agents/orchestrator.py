@@ -353,16 +353,52 @@ def _run_coro(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
+def _unwrap_task(item: object) -> list[dict]:
+    """One MCP result item → zero or more raw task dicts.
+
+    Across the MCP/SSE boundary each task arrives as a text-content block —
+    ``{"type": "text", "text": "<task json>", "id": ...}`` — so the real task dict
+    is JSON-encoded inside ``text`` (same shape the RAG chunks use). Unwrap those;
+    pass through items that are already task dicts (drop non-dicts).
+    """
+    if not isinstance(item, dict):
+        return []
+    # MCP text-content block: {"type": "text", "text": "<json>"} — the real record
+    # (a dict, or a list of them) is JSON-encoded inside `text`.
+    if item.get("type") == "text" and isinstance(item.get("text"), str):
+        try:
+            inner = json.loads(item["text"])
+        except (ValueError, TypeError):
+            return []
+        if isinstance(inner, dict):
+            return [inner]
+        if isinstance(inner, list):
+            return [r for r in inner if isinstance(r, dict)]
+        return []
+    return [item]  # already a task-shaped dict
+
+
 def _coerce_raw(result: object) -> list[dict]:
-    """Turn an MCP tool result (str/list/dict) into a list of raw task dicts."""
+    """Turn an MCP tool result into a list of raw task dicts.
+
+    Handles a JSON string, a ``{"tasks"/"data"/"results": [...]}`` wrapper, a plain
+    list of task dicts, and the MCP **text-content block** shape (each list item is
+    ``{"type": "text", "text": "<json>"}`` with the task JSON inside ``text``).
+    """
     if isinstance(result, str):
-        result = json.loads(result)
+        try:
+            result = json.loads(result)
+        except (ValueError, TypeError):
+            return []
     if isinstance(result, dict):
         # Some servers wrap the list, e.g. {"tasks": [...]}.
-        result = result.get("tasks", result.get("data", []))
+        result = result.get("tasks", result.get("data", result.get("results", [])))
     if not isinstance(result, list):
         raise ValueError(f"Unexpected task payload type: {type(result).__name__}")
-    return [r for r in result if isinstance(r, dict)]
+    out: list[dict] = []
+    for item in result:
+        out.extend(_unwrap_task(item))
+    return out
 
 
 def make_mcp_fetcher(tools: list[BaseTool]) -> RawFetcher:

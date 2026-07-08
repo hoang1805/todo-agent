@@ -30,6 +30,17 @@ def test_heuristic_normalize_accepts_name_and_due_date_aliases():
     assert tl.tasks[0].category == "health"
 
 
+def test_heuristic_normalize_maps_out_of_vocab_priority():
+    # task-mcp allows "critical", which isn't in our low/medium/high contract —
+    # the normalizer must map it (→ high), not reject the whole batch.
+    tl = heuristic_normalize([
+        {"id": 1, "title": "Hotfix prod", "priority": "critical"},
+        {"id": 2, "title": "Tidy desk", "priority": "whatever"},   # unknown → medium
+    ])
+    assert tl.tasks[0].priority == Priority.high
+    assert tl.tasks[1].priority == Priority.medium
+
+
 def test_todo_agent_happy_path():
     agent = TodoAgent(fetch_raw=sample_raw_tasks, normalize=heuristic_normalize)
     tl = agent.run()

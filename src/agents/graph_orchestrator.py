@@ -130,6 +130,11 @@ _UNKNOWN_MSG = (
     "I can plan your day or summarize your tasks. "
     "Try \"plan my day\" or \"what's on my list?\""
 )
+_LLM_UNAVAILABLE_MSG = (
+    "The assistant model isn't reachable right now, so I can't answer that freely. "
+    "I can still plan your day or summarize your tasks — try \"plan my day\" or "
+    "\"what's on my list?\". (Check that Ollama is running and reachable.)"
+)
 _MUTATION_PARSE_ERROR_MSG = (
     "I couldn't tell exactly what change you wanted (or which task it refers to). "
     "Please rephrase — e.g. \"add a task to call the bank\" or "
@@ -762,9 +767,15 @@ def build_graph_orchestrator(
         if convo:
             recent = "\n".join(f"{t['role']}: {t['content']}" for t in convo)
             system += f"\n\n## Recent conversation (for context)\n{recent}"
-        response = llm_with_tools.invoke(
-            [SystemMessage(content=system), *state["messages"]]
-        )
+        try:
+            response = llm_with_tools.invoke(
+                [SystemMessage(content=system), *state["messages"]]
+            )
+        except Exception as exc:  # noqa: BLE001 — an unreachable/erroring LLM must not
+            # crash the turn (Ollama down, timeout, …). Degrade like every other LLM
+            # call in the app instead of surfacing a raw traceback to the user.
+            logger.warning("Chat agent LLM call failed (%s); degrading gracefully.", exc)
+            return {"messages": [AIMessage(content=_LLM_UNAVAILABLE_MSG)]}
         return {"messages": [response]}
 
     def finalize(state: PlannerState) -> dict:

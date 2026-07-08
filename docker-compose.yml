@@ -40,7 +40,7 @@ services:
       # Reach the MCP servers by their compose service names (not localhost).
       TASK_MCP_URL: http://task-mcp:8000/sse
       MEMORY_MCP_URL: http://memory-mcp:8002/sse
-      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_HOST: http://192.168.1.200:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b-cloud}
       GUARDRAIL_MODEL: ${GUARDRAIL_MODEL:-ministral-3:14b-cloud}
       GUARDRAIL_USE_LLM: ${GUARDRAIL_USE_LLM:-1}

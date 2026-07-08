@@ -15,8 +15,11 @@ ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
     HISTORY_DB=/data/chat-history.db \
     EVENTS_DB=/data/events.db \
-    CHECKPOINT_DB=/data/agent-checkpoints.db
+    CHECKPOINT_DB=/data/agent-checkpoints.db \
+    AGENT_DEBUG=1
 
 # One app, one port — chat + dashboard both served here.
+# NOTE: exec-form CMD can't do `VAR=value cmd` (that only works in a shell) — set
+# env vars via ENV above (or `environment:` in compose), never as an argv element.
 EXPOSE 8501
 CMD ["streamlit", "run", "src/app.py", "--server.port=8501", "--server.address=0.0.0.0"]

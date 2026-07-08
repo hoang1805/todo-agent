@@ -37,6 +37,22 @@ def test_coerce_raw_drops_non_dicts():
     assert _coerce_raw([{"id": 1}, "garbage", 5]) == [{"id": 1}]
 
 
+def test_coerce_raw_unwraps_mcp_text_content_blocks():
+    # Over the MCP/SSE boundary each task is a text-content block with the real
+    # task JSON inside `text` — the shape that regressed the todo/planner path.
+    blocks = [
+        {"type": "text", "text": json.dumps({"id": "1", "title": "Ship it", "priority": "high"}), "id": "lc_a"},
+        {"type": "text", "text": json.dumps({"id": "2", "title": "Review", "priority": "critical"}), "id": "lc_b"},
+    ]
+    out = _coerce_raw(blocks)
+    assert [r["title"] for r in out] == ["Ship it", "Review"]        # real titles, not empty
+
+
+def test_coerce_raw_unwraps_text_block_holding_a_json_list():
+    payload = [{"type": "text", "text": json.dumps([{"id": 1, "title": "a"}, {"id": 2, "title": "b"}])}]
+    assert [r["title"] for r in _coerce_raw(payload)] == ["a", "b"]
+
+
 def test_coerce_raw_rejects_unexpected_type():
     with pytest.raises(ValueError):
         _coerce_raw(42)
